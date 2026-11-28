@@ -1188,8 +1188,8 @@
    if (!aiClient.connected()) {
      aiClient.stop();
      aiClient.useBuiltinCACertBundle();
-     aiClient.setHandshakeTimeout(15);
-     if (!aiClient.connect(BACKEND_HOST, 443, 10000)) {
+     aiClient.setHandshakeTimeout(20);          // Render free tier can be slow to wake
+     if (!aiClient.connect(BACKEND_HOST, 443, 20000)) {
        LOGF("backend connect failed, heap=%u\n", (unsigned)ESP.getFreeHeap());
        return false;
      }
@@ -1263,8 +1263,12 @@
    char msg[24];
    LOGF("backend HTTP %d: %.200s\n", code, code ? aiBody : "");
    if (code == 0) snprintf(msg, sizeof(msg), "No connection");
+   else if (code == 401) snprintf(msg, sizeof(msg), "Bad login");
+   else if (code == 503) snprintf(msg, sizeof(msg), "Server busy");
    else if (!jsonFind(aiBody, "error", msg, sizeof(msg))) snprintf(msg, sizeof(msg), "Server error %d", code);
-   aiFail(gen, msg);                            // the server sends short messages
+   // Keep on-screen text short for 128px display
+   msg[sizeof(msg) - 1] = 0;
+   aiFail(gen, msg);
  }
  
  // Upload the recording. Returns the HTTP status, 0 = no reply, -1 = not sent.

@@ -29,6 +29,29 @@
   .song-row .actions button { flex: 1 1 auto; min-width: 72px; }
   .upload-row { border: 1px solid #ccc; border-radius: 8px; padding: 8px; margin: 8px 0; }
   progress { width: 100%; height: 10px; }
+  .device-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .device-row .info { flex: 1 1 160px; min-width: 0; }
+  .device-row .info strong { display: block; }
+  .device-row .info span { font-size: 13px; color: #555; word-break: break-all; }
+  .device-row .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .device-row .actions button { width: auto; margin: 0; min-width: 72px; }
+  .modal-bg {
+    display: none; position: fixed; inset: 0; background: rgba(0,0,0,.45);
+    z-index: 40; align-items: flex-end; justify-content: center; padding: 12px;
+  }
+  .modal-bg.open { display: flex; }
+  .modal {
+    background: #fff; width: min(560px, 100%); max-height: min(88vh, 720px);
+    overflow: auto; border-radius: 12px 12px 8px 8px; padding: 14px 14px 18px;
+    box-shadow: 0 8px 28px rgba(0,0,0,.25);
+  }
+  .modal-head { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 8px; }
+  .modal-head .titles { flex: 1; min-width: 0; }
+  .modal-head button { width: auto; margin: 0; flex-shrink: 0; }
+  @media (min-width: 520px) {
+    .modal-bg { align-items: center; }
+    .modal { border-radius: 12px; }
+  }
 </style>
 </head>
 <body>
@@ -174,6 +197,19 @@
 </div>
 <p id="msg" class="msg"></p>
 
+<div id="deviceModalBg" class="modal-bg" role="dialog" aria-modal="true" aria-labelledby="deviceModalTitle">
+  <div class="modal" id="deviceModal">
+    <div class="modal-head">
+      <div class="titles">
+        <strong id="deviceModalTitle">Device</strong>
+        <p id="deviceModalSub" class="hint"></p>
+      </div>
+      <button type="button" id="deviceModalClose">Close</button>
+    </div>
+    <div id="deviceModalBody"></div>
+  </div>
+</div>
+
 <script>
 const API = "https://ruju-zxb0.onrender.com";
 const $ = id => document.getElementById(id);
@@ -241,9 +277,19 @@ function fillSelect(sel, options, value) {
   });
 }
 
-function deviceCard(device) {
-  const box = el("div", { class: "box" });
-  box.appendChild(el("p", { text: `${device.name}\n${device.id} — ${device.online ? "online" : "offline"} (cfg v${device.config_version})` }));
+function closeDeviceModal() {
+  $("deviceModalBg").classList.remove("open");
+  $("deviceModalBody").replaceChildren();
+}
+function openDeviceModal(device) {
+  $("deviceModalTitle").textContent = device.name || "Device";
+  $("deviceModalSub").textContent =
+    `${device.id} — ${device.online ? "online" : "offline"} (cfg v${device.config_version})`;
+  const body = $("deviceModalBody");
+  body.replaceChildren(deviceSettingsForm(device));
+  $("deviceModalBg").classList.add("open");
+}
+function deviceSettingsForm(device) {
   const form = el("form");
   const mkNum = (name, val, step) => { const i = el("input", { name, type: "number", step: step || "1" }); i.value = val; return i; };
   const mkText = (name, val) => { const i = el("input", { name, type: "text" }); i.value = val; return i; };
@@ -297,17 +343,37 @@ function deviceCard(device) {
     run(async () => {
       await call("/devices/" + device.id + "/settings", "POST", body);
       setMsg("Device settings saved.", true);
+      closeDeviceModal();
       await loadDevices();
     });
   };
-  box.appendChild(form);
+  return form;
+}
+function deviceCard(device) {
+  const box = el("div", { class: "box device-row" });
+  const info = el("div", { class: "info" });
+  info.appendChild(el("strong", { text: device.name || "(unnamed)" }));
+  info.appendChild(el("span", {
+    text: `${device.id} · ${device.online ? "online" : "offline"} · cfg v${device.config_version}`
+  }));
+  const actions = el("div", { class: "actions" });
+  const view = el("button", { type: "button", text: "View" });
+  view.onclick = () => openDeviceModal(device);
   const remove = el("button", { type: "button", text: "Remove" });
-  remove.onclick = () => confirm("Remove this device?") && run(async () => {
-    await call("/devices/" + device.id, "DELETE"); await loadDevices();
+  remove.onclick = () => confirm("Remove “" + (device.name || device.id) + "”?") && run(async () => {
+    await call("/devices/" + device.id, "DELETE");
+    closeDeviceModal();
+    await loadDevices();
   });
-  box.appendChild(remove);
+  actions.append(view, remove);
+  box.append(info, actions);
   return box;
 }
+$("deviceModalClose").onclick = () => closeDeviceModal();
+$("deviceModalBg").onclick = e => { if (e.target === $("deviceModalBg")) closeDeviceModal(); };
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && $("deviceModalBg").classList.contains("open")) closeDeviceModal();
+});
 
 async function loadDevices() {
   const d = await call("");
