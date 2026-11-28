@@ -1,10 +1,40 @@
 {
-  "version": 2,
+  "version": 1,
   "topics": [
     {
       "id": "faith",
       "name": "Faith",
       "count": 10
+    },
+    {
+      "id": "quran",
+      "name": "Quran",
+      "count": 10
+    },
+    {
+      "id": "prophet-muhammad",
+      "name": "Prophet Muhammad",
+      "count": 12
+    },
+    {
+      "id": "prayer",
+      "name": "Prayer",
+      "count": 10
+    },
+    {
+      "id": "wudu",
+      "name": "Wudu",
+      "count": 6
+    },
+    {
+      "id": "fasting",
+      "name": "Fasting",
+      "count": 8
+    },
+    {
+      "id": "zakat",
+      "name": "Zakat",
+      "count": 4
     }
   ]
 }
