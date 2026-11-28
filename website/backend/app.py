@@ -11,10 +11,14 @@ DATABASE_URL = os.getenv("DATABASE_URL")        # Neon (keeps data after restart
 DEFAULT_CONTENT_URL = os.getenv(
     "DEFAULT_CONTENT_URL", "https://buxinelectronics-art.github.io/Ruju"
 ).rstrip("/")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "buxinelectronics-art/Ruju")
+GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
+GITHUB_ALLOWED = ("docs/adhan/", "docs/huruf/", "docs/hadith/", "docs/qa/")
 fernet = Fernet(base64.urlsafe_b64encode(hashlib.sha256(SECRET_KEY.encode()).digest()))
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 400 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 6 * 1024 * 1024   # Adhan MP3 uploads
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
 app.json.ensure_ascii = False
 CORS(app, resources={r"/api/admin.*": {"origins": os.getenv("FRONTEND_ORIGIN", "*").rstrip("/")}})
@@ -390,6 +394,107 @@ def test_chat():
 def test_speak():
     text = str(body().get("text", "")).strip()[:900]
     return Response(tts(text), mimetype="audio/mpeg") if text else error("Type something", 400)
+
+# ---------- GitHub Pages content (docs/ only) ----------
+def github_configured():
+    return bool(GITHUB_TOKEN and GITHUB_REPO and GITHUB_BRANCH)
+
+def github_headers():
+    if not GITHUB_TOKEN:
+        raise RuntimeError("GITHUB_TOKEN not set on server")
+    return {
+        "Authorization": "Bearer " + GITHUB_TOKEN,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+def github_assert_path(path):
+    path = path.replace("\\", "/").lstrip("/")
+    if ".." in path.split("/") or not path.startswith(GITHUB_ALLOWED):
+        raise ValueError("path not allowed")
+    return path
+
+def github_get_file(path):
+    path = github_assert_path(path)
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+    r = requests.get(url, headers=github_headers(), params={"ref": GITHUB_BRANCH}, timeout=40)
+    if r.status_code == 404:
+        return None
+    if not r.ok:
+        raise RuntimeError(f"GitHub read failed ({r.status_code})")
+    return r.json()
+
+def github_put_file(path, data_bytes, message):
+    path = github_assert_path(path)
+    if not isinstance(data_bytes, (bytes, bytearray)) or not data_bytes:
+        raise ValueError("empty file")
+    existing = github_get_file(path)
+    payload = {
+        "message": message,
+        "content": base64.b64encode(data_bytes).decode("ascii"),
+        "branch": GITHUB_BRANCH,
+    }
+    if existing and existing.get("sha"):
+        payload["sha"] = existing["sha"]
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+    r = requests.put(url, headers=github_headers(), json=payload, timeout=60)
+    if not r.ok:
+        raise RuntimeError(f"GitHub write failed ({r.status_code}): {r.text[:200]}")
+    return r.json()
+
+def looks_like_mp3(data):
+    if len(data) < 4:
+        return False
+    if data[:3] == b"ID3":
+        return True
+    # MPEG frame sync
+    return data[0] == 0xFF and (data[1] & 0xE0) == 0xE0
+
+@app.get("/api/admin/content/adhan")
+def adhan_status():
+    if not github_configured():
+        return error("Set GITHUB_TOKEN, GITHUB_REPO and GITHUB_BRANCH on Render", 503)
+    out = {}
+    for name in ("adhan.mp3", "fajr.mp3"):
+        path = "docs/adhan/" + name
+        try:
+            info = github_get_file(path)
+        except Exception as e:
+            return error(str(e), 502)
+        out[name] = None if not info else {
+            "path": path,
+            "size": info.get("size", 0),
+            "sha": info.get("sha", "")[:12],
+            "url": info.get("download_url") or info.get("html_url"),
+        }
+    return jsonify(files=out, repo=GITHUB_REPO, branch=GITHUB_BRANCH)
+
+@app.post("/api/admin/content/adhan")
+def adhan_upload():
+    if not github_configured():
+        return error("Set GITHUB_TOKEN, GITHUB_REPO and GITHUB_BRANCH on Render", 503)
+    kind = str(request.form.get("kind", "")).strip().lower()
+    if kind not in ("adhan", "fajr"):
+        return error("kind must be adhan or fajr", 400)
+    f = request.files.get("file")
+    if not f:
+        return error("Choose an MP3 file", 400)
+    raw = f.read()
+    if len(raw) < 1000:
+        return error("File is too small", 400)
+    if len(raw) > 5 * 1024 * 1024:
+        return error("File is too large (max 5 MB)", 400)
+    if not looks_like_mp3(raw):
+        return error("File does not look like an MP3", 400)
+    name = kind + ".mp3"
+    path = "docs/adhan/" + name
+    try:
+        github_put_file(path, raw, f"Update {path}")
+    except ValueError as e:
+        return error(str(e), 400)
+    except Exception as e:
+        return error(str(e), 502)
+    return jsonify(ok=True, path=path, size=len(raw))
 
 # ---------- ESP32 ----------
 def device_id():

@@ -30,6 +30,7 @@
 <div id="app" hidden>
   <nav>
     <button id="tabDevices" class="on">Devices</button>
+    <button id="tabContent">Content</button>
     <button id="tabApi">API &amp; Test</button>
   </nav>
 
@@ -40,6 +41,22 @@
       <p id="newDevice"></p>
     </form>
     <div id="list"></div>
+  </section>
+
+  <section id="content" hidden>
+    <div class="box">
+      <b>Adhan MP3</b>
+      <p id="adhanStatus">Loading…</p>
+      <label>adhan.mp3 (Dhuhr / Asr / Maghrib / Isha)
+        <input id="fileAdhan" type="file" accept="audio/mpeg,.mp3">
+      </label>
+      <button type="button" id="uploadAdhan">Upload adhan.mp3</button>
+      <label>fajr.mp3 (Fajr only)
+        <input id="fileFajr" type="file" accept="audio/mpeg,.mp3">
+      </label>
+      <button type="button" id="uploadFajr">Upload fajr.mp3</button>
+      <small>Files are saved to GitHub docs/adhan/ for Pages. Max 5 MB each.</small>
+    </div>
   </section>
 
   <section id="api" hidden>
@@ -90,7 +107,18 @@ async function call(path, method = "GET", body) {
     body: body && JSON.stringify(body)
   });
   if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || "Request failed");
-  return r.headers.get("Content-Type").startsWith("audio") ? r.blob() : r.json();
+  const ct = r.headers.get("Content-Type") || "";
+  return ct.startsWith("audio") ? r.blob() : r.json();
+}
+
+async function upload(path, formData) {
+  const r = await fetch(API + "/api/admin" + path, {
+    method: "POST",
+    headers: { "X-Admin-Password": password },
+    body: formData
+  });
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || "Upload failed");
+  return r.json();
 }
 
 async function run(action) {
@@ -222,6 +250,23 @@ function deviceCard(device) {
   return box;
 }
 
+async function loadAdhanStatus() {
+  const el = $("adhanStatus");
+  el.textContent = "Checking GitHub…";
+  try {
+    const d = await call("/content/adhan");
+    const lines = [];
+    ["adhan.mp3", "fajr.mp3"].forEach(name => {
+      const f = d.files[name];
+      lines.push(f ? `${name}: ${f.size} bytes (sha ${f.sha})` : `${name}: not uploaded yet`);
+    });
+    lines.push(`Repo ${d.repo} @ ${d.branch}`);
+    el.textContent = lines.join("\n");
+  } catch (e) {
+    el.textContent = e.message;
+  }
+}
+
 async function load() {
   const d = await call("");
   meta.methods = d.methods || meta.methods;
@@ -230,6 +275,7 @@ async function load() {
   $("keyState").textContent = d.has_key ? "(key saved)" : "(no key yet)";
   FIELDS.forEach(f => $(f).value = d.settings[f]);
   $("list").replaceChildren(...d.devices.map(deviceCard));
+  loadAdhanStatus();
 }
 
 $("login").onsubmit = e => {
@@ -238,12 +284,31 @@ $("login").onsubmit = e => {
   run(async () => { await load(); $("login").hidden = true; $("app").hidden = false; });
 };
 
-function tab(api) {
-  $("api").hidden = !api; $("devices").hidden = api;
-  $("tabApi").className = api ? "on" : ""; $("tabDevices").className = api ? "" : "on";
+function tab(which) {
+  $("devices").hidden = which !== "devices";
+  $("content").hidden = which !== "content";
+  $("api").hidden = which !== "api";
+  $("tabDevices").className = which === "devices" ? "on" : "";
+  $("tabContent").className = which === "content" ? "on" : "";
+  $("tabApi").className = which === "api" ? "on" : "";
+  if (which === "content") loadAdhanStatus();
 }
-$("tabDevices").onclick = () => tab(false);
-$("tabApi").onclick = () => tab(true);
+$("tabDevices").onclick = () => tab("devices");
+$("tabContent").onclick = () => tab("content");
+$("tabApi").onclick = () => tab("api");
+
+async function uploadAdhan(kind, inputId) {
+  const input = $(inputId);
+  if (!input.files || !input.files[0]) throw new Error("Choose an MP3 first");
+  const fd = new FormData();
+  fd.append("kind", kind);
+  fd.append("file", input.files[0], input.files[0].name);
+  await upload("/content/adhan", fd);
+  input.value = "";
+  await loadAdhanStatus();
+}
+$("uploadAdhan").onclick = () => run(() => uploadAdhan("adhan", "fileAdhan"));
+$("uploadFajr").onclick = () => run(() => uploadAdhan("fajr", "fileFajr"));
 
 $("add").onsubmit = e => {
   e.preventDefault();

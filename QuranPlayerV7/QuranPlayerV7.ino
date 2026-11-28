@@ -74,9 +74,12 @@
  #define BACKEND_HOST "ruju-zxb0.onrender.com"   // no https://, no slash
  #define PRODUCT_ID   "QP-D179E0F4"
  #define DEVICE_TOKEN "PwmtsYePeRjc37_lFsyEp-7MsnhPqPVfIwcxut4MHWM"
- #define FW_VERSION   "7.0-p1"
+ #define FW_VERSION   "7.0-p2"
  // Default content site (dashboard can override per device). No trailing slash.
  #define CONTENT_BASE_URL "https://buxinelectronics-art.github.io/Ruju"
+ #define CONTENT_SURAH 255          // Clip.surah for GitHub Pages / content MP3s
+ #define ADHAN_WINDOW_MIN 2         // fire only within this many minutes of the time
+ #define ADHAN_AI_WAIT_MS 120000UL  // max wait while AI is busy
  
  #define I2S_BCLK 7
  #define I2S_LRC  20
@@ -248,8 +251,10 @@
    Status   st;
    AiShared ai;
    char     voiceId[24];        // spoken answer to play (Clip with surah 0)
+   char     contentPath[48];    // relative path for CONTENT_SURAH clips (e.g. adhan/fajr.mp3)
    bool     cfgNew;             // settings received from the dashboard
    int      cfgVolume, cfgReciter;
+   uint8_t  beepLeft;           // soft offline beeps requested from the UI
  };
  
  // ---- other types (kept up here: the Arduino IDE needs them before any function) ----
@@ -300,6 +305,22 @@
  static int prayerMin[PT_COUNT];     // minutes from local midnight
  static int prayerYday = -1;         // recomputed when the local day changes
  static int adhanScroll = 0;         // Adhan list scroll (0..1 for 6 rows / 4 visible)
+ static char contentHost[64] = "buxinelectronics-art.github.io";
+ static char contentBase[64] = "/Ruju";   // path prefix, no trailing slash
+ 
+ // Adhan auto-play runtime (Phase 2)
+ enum AdhanRun : uint8_t { AR_IDLE = 0, AR_WAIT_AI = 1, AR_PLAYING = 2, AR_BEEP = 3, AR_HOLD = 4 };
+ static AdhanRun adhanRun = AR_IDLE;
+ static int adhanWhich = -1;          // PrayerId being announced
+ static uint32_t adhanWaitStart = 0;
+ static uint8_t adhanFiredMask = 0;   // bits 0..4 = Fajr,Dhuhr,Asr,Maghrib,Isha
+ static int adhanFiredYday = -1;
+ static bool adhanAlert = false;      // full-screen "Time for ..." UI
+ static bool adhanCanResume = false;
+ static int adhanResumeSurah = 1, adhanResumeAyah = 1, adhanResumeReciter = 0;
+ static PlayMode adhanResumeMode = MODE_SURAH;
+ static Screen adhanResumeScreen = SCR_HOME;
+ static bool adhanResumeWantPlay = false;
  
  static i2s_chan_handle_t i2sTx = nullptr;
  static i2s_chan_handle_t i2sRx = nullptr;
@@ -640,14 +661,35 @@
    return true;
  }
  
+ static void contentParseUrl(const char* url) {
+   // Expect https://host[/base...]
+   snprintf(contentHost, sizeof(contentHost), "buxinelectronics-art.github.io");
+   snprintf(contentBase, sizeof(contentBase), "/Ruju");
+   if (!url || strncmp(url, "https://", 8) != 0) return;
+   const char* host = url + 8;
+   const char* slash = strchr(host, '/');
+   size_t hostLen = slash ? (size_t)(slash - host) : strlen(host);
+   if (hostLen == 0 || hostLen >= sizeof(contentHost)) return;
+   memcpy(contentHost, host, hostLen);
+   contentHost[hostLen] = 0;
+   if (slash && slash[1]) {
+     snprintf(contentBase, sizeof(contentBase), "%s", slash);
+     size_t n = strlen(contentBase);
+     while (n > 1 && contentBase[n - 1] == '/') contentBase[--n] = 0;
+   } else {
+     contentBase[0] = 0;
+   }
+ }
+ 
  // One HTTP request for the rest of the file. Keeps the TLS connection alive.
  static FetchResult fetchOnce(uint32_t gen, const Clip& c, Download& dl) {
    const bool voice = (c.surah == 0);          // AI answer from our backend
+   const bool content = (c.surah == CONTENT_SURAH);
    WiFiClientSecure& cl = voice ? aiClient : client;
-   const char* host = voice ? BACKEND_HOST : HOST;
+   const char* host = voice ? BACKEND_HOST : (content ? contentHost : HOST);
    if (!cl.connected()) {
      cl.stop();
-     if (voice) cl.useBuiltinCACertBundle(); else cl.setInsecure();
+     if (voice || content) cl.useBuiltinCACertBundle(); else cl.setInsecure();
      cl.setHandshakeTimeout(12);               // seconds
      if (!cl.connect(host, 443, 8000)) {
        LOGF("connect failed, heap=%u\n", (unsigned)ESP.getFreeHeap());
@@ -656,13 +698,22 @@
    }
    if (stale(gen)) return FR_ABORT;
  
-   char path[120];
+   char path[160];
    char auth[200] = "";
    if (voice) {
      lockSh();
      snprintf(path, sizeof(path), "/api/device/audio/%s", sh.voiceId);
      unlockSh();
      snprintf(auth, sizeof(auth), "Authorization: Bearer %s\r\nX-Product-ID: %s\r\n", DEVICE_TOKEN, PRODUCT_ID);
+   } else if (content) {
+     char rel[48];
+     lockSh();
+     snprintf(rel, sizeof(rel), "%s", sh.contentPath);
+     unlockSh();
+     if (contentBase[0])
+       snprintf(path, sizeof(path), "%s/%s", contentBase, rel);
+     else
+       snprintf(path, sizeof(path), "/%s", rel);
    } else {
      snprintf(path, sizeof(path), "/data/%s/%03u%03u.mp3",
               RECITERS[c.reciter].ayahFolder, (unsigned)c.surah, (unsigned)c.ayah);
@@ -787,7 +838,7 @@
        vTaskDelay(pdMS_TO_TICKS(100));
      }
  
-     WiFiClientSecure& cl = c.surah ? client : aiClient;
+     WiFiClientSecure& cl = (c.surah == 0) ? aiClient : client;
      bool reused = cl.connected();
      uint32_t before = dl.received;
      FetchResult r = fetchOnce(gen, c, dl);
@@ -1366,6 +1417,86 @@
    snprintf(out, n, "%02d:%02d", (mins / 60) % 24, mins % 60);
  }
  
+ static const char* prayerName(int id) {
+   static const char* const names[PT_COUNT] = {
+     "Fajr", "Sunrise", "Dhuhr", "Asr", "Maghrib", "Isha"
+   };
+   return (id >= 0 && id < PT_COUNT) ? names[id] : "?";
+ }
+ 
+ static int prayerBit(int id) {
+   switch (id) {
+     case PT_FAJR: return 0;
+     case PT_DHUHR: return 1;
+     case PT_ASR: return 2;
+     case PT_MAGHRIB: return 3;
+     case PT_ISHA: return 4;
+     default: return -1;
+   }
+ }
+ 
+ static bool prayerEnabled(int id) {
+   int b = prayerBit(id);
+   return b >= 0 && ds.prayerOn[b];
+ }
+ 
+ static void adhanLoadFired() {
+   Preferences p;
+   if (!p.begin("deen", true)) return;
+   adhanFiredYday = p.getInt("afday", -1);
+   adhanFiredMask = p.getUChar("afmask", 0);
+   p.end();
+ }
+ 
+ static void adhanSaveFired() {
+   Preferences p;
+   if (!p.begin("deen", false)) return;
+   p.putInt("afday", adhanFiredYday);
+   p.putUChar("afmask", adhanFiredMask);
+   p.end();
+ }
+ 
+ static void adhanMarkFired(int id) {
+   int b = prayerBit(id);
+   if (b < 0) return;
+   if (!prayerEnsureToday()) return;
+   time_t now = time(nullptr);
+   struct tm lt; localtime_r(&now, &lt);
+   if (adhanFiredYday != lt.tm_yday) {
+     adhanFiredYday = lt.tm_yday;
+     adhanFiredMask = 0;
+   }
+   adhanFiredMask |= (uint8_t)(1u << b);
+   adhanSaveFired();
+ }
+ 
+ static bool adhanAlreadyFired(int id) {
+   int b = prayerBit(id);
+   if (b < 0) return true;
+   if (!prayerEnsureToday()) return true;
+   time_t now = time(nullptr);
+   struct tm lt; localtime_r(&now, &lt);
+   if (adhanFiredYday != lt.tm_yday) return false;
+   return (adhanFiredMask & (1u << b)) != 0;
+ }
+ 
+ static bool adhanAiBusy() {
+   lockSh();
+   const AiShared& a = sh.ai;
+   bool speaking = sh.active && sh.first.surah == 0;
+   bool busy = a.open && (a.busy || a.recReady || speaking ||
+                          a.phase == AI_RECORDING || a.phase == AI_LISTENED ||
+                          a.phase == AI_THINKING || a.phase == AI_ANSWER);
+   unlockSh();
+   return busy;
+ }
+ 
+ static void adhanRequestBeeps() {
+   lockSh();
+   sh.beepLeft = 3;
+   unlockSh();
+ }
+ 
  // Periodic check-in: shows the device online and fetches remote settings.
  static void helloStep() {
    static uint32_t last = 0, wait = 3000, version = 0;
@@ -1456,6 +1587,7 @@
      if (aiOpen && client.connected()) client.stop();   // give the AI the memory
      if (!run) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
      doneGen = gen;
+     // CONTENT_SURAH and Quran both use "client"; AI voice uses aiClient.
  
      for (;;) {
        bool aborted = false;
@@ -1474,6 +1606,7 @@
        c = nextClip(c);
      }
      if (c.surah == 0) aiClient.stop();
+     else client.stop();
    }
  }
  
@@ -1840,7 +1973,30 @@
      }
      if (wantMic && !active) { micStep(); continue; }
      if (micOn) micStop();
-     if (!active) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+     if (!active) {
+       // Soft offline beeps (Adhan fallback). Never runs during AI mic or playback.
+       lockSh(); uint8_t beeps = sh.beepLeft; unlockSh();
+       if (beeps > 0 && i2sTx) {
+         i2sSetRate(22050);
+         const int toneN = 22050 * 120 / 1000;     // ~120 ms
+         const int gapN  = 22050 * 120 / 1000;
+         for (int i = 0; i < toneN; i++) {
+           int16_t s = ((i / 12) & 1) ? 1800 : -1800;   // soft ~880 Hz
+           pcm[0] = pcm[1] = s;
+           i2sWrite(pcm, 4);
+         }
+         for (int i = 0; i < gapN; i++) {
+           pcm[0] = pcm[1] = 0;
+           i2sWrite(pcm, 4);
+         }
+         lockSh();
+         if (sh.beepLeft > 0) sh.beepLeft--;
+         unlockSh();
+         continue;
+       }
+       vTaskDelay(pdMS_TO_TICKS(10));
+       continue;
+     }
  
      if (paused) {
        fadeOut();
@@ -2188,12 +2344,24 @@
    drawFooter("1/2 Move", "5 AI", "OK Select");
  }
  
- // ---------------- ADHAN (Phase 1: times only, no auto playback yet) ----------------
+ // ---------------- ADHAN ----------------
  void drawAdhan() {
-   static const char* const names[PT_COUNT] = {
-     "Fajr", "Sunrise", "Dhuhr", "Asr", "Maghrib", "Isha"
-   };
    drawStatusBar();
+   if (adhanAlert) {
+     char line[28];
+     u8g2.setFont(u8g2_font_6x10_tr);
+     txtC(16, "Time for");
+     snprintf(line, sizeof(line), "%s", prayerName(adhanWhich));
+     txtC(30, line);
+     if (adhanRun == AR_PLAYING) txtC(44, status);
+     else if (adhanRun == AR_BEEP) txtC(44, "Beep...");
+     else txtC(44, "Stopped");
+     if (adhanRun == AR_HOLD)
+       drawFooter("<Home", adhanCanResume ? "OK Resume" : nullptr, "5 AI");
+     else
+       drawFooter("4 Stop", nullptr, "5 AI");
+     return;
+   }
    u8g2.setFont(u8g2_font_5x7_tr);
    if (!prayerEnsureToday()) {
      u8g2.setFont(u8g2_font_6x10_tr);
@@ -2210,15 +2378,9 @@
      int y = 12 + i * 10;
      char line[28], clock[8];
      fmtPrayerClock(prayerMin[id], clock, sizeof(clock));
-     bool enabled = true;
-     if (id == PT_FAJR) enabled = ds.prayerOn[0];
-     else if (id == PT_DHUHR) enabled = ds.prayerOn[1];
-     else if (id == PT_ASR) enabled = ds.prayerOn[2];
-     else if (id == PT_MAGHRIB) enabled = ds.prayerOn[3];
-     else if (id == PT_ISHA) enabled = ds.prayerOn[4];
-     else enabled = false;   // Sunrise: never Adhan
+     bool enabled = (id == PT_SUNRISE) ? false : prayerEnabled(id);
      if (id == next) u8g2.drawRFrame(0, y, 128, 10, 3);
-     snprintf(line, sizeof(line), "%s %s%s", names[id], clock, enabled ? "" : " off");
+     snprintf(line, sizeof(line), "%s %s%s", prayerName(id), clock, enabled ? "" : " off");
      u8g2.setFont(u8g2_font_6x10_tr);
      u8g2.drawStr(2, y + 1, line);
    }
@@ -2589,6 +2751,14 @@
  }
  
  void goBack() {
+   if (adhanAlert && (adhanRun == AR_PLAYING || adhanRun == AR_BEEP || adhanRun == AR_WAIT_AI)) {
+     adhanEnterHold();
+     return;
+   }
+   if (adhanAlert && adhanRun == AR_HOLD) {
+     adhanDismiss();
+     return;
+   }
    if (session) stopPlayback("Stopped");
    switch (screen) {
      case SCR_HOME:   break;
@@ -2621,6 +2791,7 @@
    if (!cfg) return;
  
    bool zoneChanged = strcmp(ds.timezone, pending.timezone) != 0;
+   bool urlChanged = strcmp(ds.contentUrl, pending.contentUrl) != 0;
    bool placeChanged = (fabsf(ds.lat - pending.lat) > 0.0001f) ||
                        (fabsf(ds.lon - pending.lon) > 0.0001f) ||
                        ds.method != pending.method || ds.asr != pending.asr ||
@@ -2629,11 +2800,148 @@
    ds = pending;
    dsSavePrefs();
    if (zoneChanged) timeApplyZone();
+   if (urlChanged) contentParseUrl(ds.contentUrl);
    if (placeChanged || zoneChanged) prayerYday = -1;
    if (cv >= 5 && cv <= 100) { volLevel = cv / 100.0f; playerVolume(volLevel); }
    if (cr >= 0 && cr < RECITER_COUNT) reciterIdx = cr;
    dirty = true;
    LOGF("cloud cfg v%u applied\n", (unsigned)ds.configVersion);
+ }
+ 
+ static void adhanBeginPlay(int prayerId) {
+   adhanWhich = prayerId;
+   adhanMarkFired(prayerId);
+   adhanAlert = true;
+ 
+   adhanCanResume = (surah >= 1 && surah <= 114);
+   adhanResumeSurah = surah;
+   adhanResumeAyah = ayah;
+   adhanResumeReciter = reciterIdx;
+   adhanResumeMode = playMode;
+   adhanResumeScreen = (screen == SCR_AI) ? aiReturn : screen;
+   if (adhanResumeScreen == SCR_ADHAN || adhanResumeScreen == SCR_AI ||
+       adhanResumeScreen == SCR_HURUF || adhanResumeScreen == SCR_HADITH ||
+       adhanResumeScreen == SCR_QA)
+     adhanResumeScreen = SCR_PLAYER;
+   adhanResumeWantPlay = session && !paused && surah >= 1 && surah <= 114;
+ 
+   if (screen == SCR_AI) aiSetOpen(false);
+   if (session) stopPlayback("Adhan");
+ 
+   const char* file = (prayerId == PT_FAJR) ? "adhan/fajr.mp3" : "adhan/adhan.mp3";
+   lockSh();
+   snprintf(sh.contentPath, sizeof(sh.contentPath), "%s", file);
+   unlockSh();
+ 
+   Clip c = { CONTENT_SURAH, (uint16_t)((prayerId == PT_FAJR) ? 2 : 1), 0 };
+   playGen = playerStart(c, false);
+   session = true;
+   paused = false;
+   stepPending = false;
+   status = "Adhan...";
+   adhanRun = AR_PLAYING;
+   goScreen(SCR_ADHAN);
+   dirty = true;
+ }
+ 
+ static void adhanStartBeepFallback(int prayerId) {
+   if (session) stopPlayback("Adhan");
+   adhanWhich = prayerId;
+   adhanMarkFired(prayerId);
+   adhanAlert = true;
+   adhanRequestBeeps();
+   adhanRun = AR_BEEP;
+   status = "Time for prayer";
+   goScreen(SCR_ADHAN);
+   dirty = true;
+ }
+ 
+ static void adhanEnterHold() {
+   if (session) stopPlayback("Stopped");
+   adhanRun = AR_HOLD;
+   adhanAlert = true;
+   status = "Stopped";
+   dirty = true;
+ }
+ 
+ static void adhanDismiss() {
+   adhanRun = AR_IDLE;
+   adhanAlert = false;
+   adhanWhich = -1;
+   goScreen(SCR_HOME);
+   dirty = true;
+ }
+ 
+ static void adhanResumePrev() {
+   adhanRun = AR_IDLE;
+   adhanAlert = false;
+   if (!adhanCanResume) { goScreen(SCR_HOME); return; }
+   surah = adhanResumeSurah;
+   ayah = adhanResumeAyah;
+   reciterIdx = adhanResumeReciter;
+   playMode = adhanResumeMode;
+   goScreen(adhanResumeScreen == SCR_AYAHS ? SCR_AYAHS : SCR_PLAYER);
+   if (adhanResumeWantPlay && adhanResumeScreen != SCR_AYAHS) startPlayback();
+   dirty = true;
+ }
+ 
+ static void adhanTick() {
+   if (bootPhase != BOOT_DONE) return;
+ 
+   if (adhanRun == AR_BEEP) {
+     lockSh(); uint8_t left = sh.beepLeft; unlockSh();
+     if (left == 0) adhanEnterHold();
+     return;
+   }
+ 
+   if (adhanRun == AR_PLAYING) {
+     if (!session) {
+       Status s = playerStatus();
+       if (s.gen == playGen && s.state == PS_ERROR) adhanStartBeepFallback(adhanWhich);
+       else adhanEnterHold();
+     }
+     return;
+   }
+ 
+   if (adhanRun == AR_WAIT_AI) {
+     if (!adhanAiBusy() || millis() - adhanWaitStart >= ADHAN_AI_WAIT_MS) {
+       if (WiFi.status() != WL_CONNECTED) adhanStartBeepFallback(adhanWhich);
+       else adhanBeginPlay(adhanWhich);
+     }
+     return;
+   }
+ 
+   if (adhanRun != AR_IDLE) return;
+   if (!prayerEnsureToday()) return;
+ 
+   time_t nowt = time(nullptr);
+   struct tm lt; localtime_r(&nowt, &lt);
+   if (adhanFiredYday != lt.tm_yday) {
+     adhanFiredYday = lt.tm_yday;
+     adhanFiredMask = 0;
+     adhanSaveFired();
+   }
+ 
+   int now = lt.tm_hour * 60 + lt.tm_min;
+   static const int order[5] = { PT_FAJR, PT_DHUHR, PT_ASR, PT_MAGHRIB, PT_ISHA };
+   for (int i = 0; i < 5; i++) {
+     int id = order[i];
+     if (!prayerEnabled(id) || adhanAlreadyFired(id)) continue;
+     int t = prayerMin[id];
+     if (now < t || now >= t + ADHAN_WINDOW_MIN) continue;
+ 
+     adhanWhich = id;
+     if (adhanAiBusy()) {
+       adhanRun = AR_WAIT_AI;
+       adhanWaitStart = millis();
+       LOGF("adhan waiting for AI (%s)\n", prayerName(id));
+     } else if (WiFi.status() != WL_CONNECTED) {
+       adhanStartBeepFallback(id);
+     } else {
+       adhanBeginPlay(id);
+     }
+     break;
+   }
  }
  
  // Copy what the audio engine is doing into the UI.
@@ -2651,17 +2959,21 @@
    } else if (s.state == PS_ERROR) {
      session = false;
      paused = false;
-     surah = s.clip.surah;                 // OK retries from the ayah that failed
-     ayah = s.clip.ayah;
+     if (s.clip.surah >= 1 && s.clip.surah <= 114) {
+       surah = s.clip.surah;                 // OK retries from the ayah that failed
+       ayah = s.clip.ayah;
+     }
      msg = (s.error == PE_WIFI) ? "No WiFi" : (s.error == PE_NOTFOUND) ? "Not found" : "Network error";
      dirty = true;
    } else {
-     if (s.clip.surah != surah || s.clip.ayah != ayah) {
+     if (s.clip.surah >= 1 && s.clip.surah <= 114 &&
+         (s.clip.surah != surah || s.clip.ayah != ayah)) {
        surah = s.clip.surah;
        ayah = s.clip.ayah;
        dirty = true;
      }
-     if (paused) msg = "Paused";
+     if (adhanRun == AR_PLAYING) msg = "Adhan...";
+     else if (paused) msg = "Paused";
      else if (s.state == PS_PLAYING) msg = "Playing";
      else if (s.state == PS_BUFFERING) msg = (s.elapsedMs > 0) ? "Buffering..." : "Loading...";
      if (bootPhase == BOOT_BISMILLAH) msg = "Bismillah...";
@@ -2719,6 +3031,12 @@
  
    if (k == KEY4) { goBack(); return; }
    if (k == KEY5) {
+     if (adhanAlert) {                         // clear Adhan so AI does not overlap
+       if (session) stopPlayback("Stopped");
+       adhanRun = AR_IDLE;
+       adhanAlert = false;
+       adhanWhich = -1;
+     }
      if (screen != SCR_AI) openAI();            // 1st press: open the page
      else {                                     // on the page: hold to speak
        playerStop();                            // silence a spoken answer
@@ -2726,6 +3044,15 @@
      }
      dirty = true;
      return;
+   }
+ 
+   if (adhanAlert && adhanRun == AR_HOLD && k == KEY3) {
+     adhanResumePrev();
+     return;
+   }
+   if (adhanAlert && adhanRun != AR_IDLE && adhanRun != AR_HOLD) {
+     if (k == KEY3) { adhanEnterHold(); return; }
+     return;                                   // ignore nav while Adhan plays
    }
  
    const int dir = (k == KEY1) ? -1 : +1;
@@ -2870,11 +3197,15 @@
    if (!ssid.length() || digitalRead(BTN[3]) == LOW) runWifiSetup(ssid.length() > 0);
  
    dsLoadPrefs();
+   contentParseUrl(ds.contentUrl);
    timeApplyZone();
+   adhanLoadFired();
  
    mtx = xSemaphoreCreateMutex();
    keyQueue = xQueueCreate(24, sizeof(KeyEvent));
    sh.volume = volLevel;
+   sh.beepLeft = 0;
+   sh.contentPath[0] = 0;
  
    // Audio memory first, before WiFi takes the big blocks. Allocated once.
    audioOk = i2sInit();
@@ -2933,11 +3264,14 @@
    pollAI();
  
    applyCloudSettings();
+   adhanTick();
  
    if (bootPhase == BOOT_BISMILLAH && !session) finishBoot();
  
    // Hard rule: on Home, nothing plays (Bismillah uses the splash, not Home)
-   if (bootPhase == BOOT_DONE && screen == SCR_HOME && session) stopPlayback("Ready");
+   // Exception: Adhan alert may briefly use SCR_ADHAN, not Home.
+   if (bootPhase == BOOT_DONE && screen == SCR_HOME && session && !adhanAlert)
+     stopPlayback("Ready");
  
    // Keep NTP status fresh once Wi-Fi is up (non-blocking).
    static uint32_t lastTimePoll = 0;
@@ -2958,7 +3292,7 @@
      if (aiPhase == AI_RECORDING) period = 150;
      else if (aiPhase == AI_LISTENED || aiPhase == AI_THINKING) period = 350;
    }
-   if (screen == SCR_ADHAN) period = 1000;
+   if (screen == SCR_ADHAN || adhanAlert || adhanRun == AR_WAIT_AI) period = 500;
    if (dirty || now - lastDraw >= period) {
      dirty = false;
      lastDraw = now;
