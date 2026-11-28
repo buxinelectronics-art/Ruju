@@ -54,7 +54,12 @@
     {
       "id": "hereafter",
       "name": "Hereafter",
-      "count": 2
+      "count": 8
+    },
+    {
+      "id": "general",
+      "name": "General",
+      "count": 4
     }
   ]
 }
