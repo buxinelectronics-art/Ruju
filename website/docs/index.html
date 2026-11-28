@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Admin Dashboard</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 560px; margin: auto; padding: 16px; }
+  input, textarea, select, button { box-sizing: border-box; font: inherit; padding: 9px; margin: 4px 0; }
+  input, textarea, select { width: 100%; }
+  button { cursor: pointer; }
+  nav button.on { font-weight: bold; border-width: 3px; }
+  .box { border: 1px solid #8888; border-radius: 8px; padding: 12px; margin: 12px 0; }
+  .box p { white-space: pre-wrap; overflow-wrap: anywhere; }
+</style>
+</head>
+<body>
+<h2>Admin Dashboard</h2>
+
+<form id="login">
+  <input id="password" type="password" placeholder="Admin password" required>
+  <button>Log in</button>
+</form>
+
+<div id="app" hidden>
+  <nav>
+    <button id="tabDevices" class="on">Devices</button>
+    <button id="tabApi">API &amp; Test</button>
+  </nav>
+
+  <section id="devices">
+    <form id="add" class="box">
+      <input id="name" placeholder="Device name" required>
+      <button>Add device</button>
+      <p id="newDevice"></p>
+    </form>
+    <div id="list"></div>
+  </section>
+
+  <section id="api" hidden>
+    <form id="config" class="box">
+      <b>OpenAI settings</b> <span id="keyState"></span>
+      <input id="api_key" type="password" placeholder="OpenAI API key (leave empty to keep)" autocomplete="off">
+      <label>Chat model<input id="chat_model"></label>
+      <label>Speech-to-text model<input id="stt_model"></label>
+      <label>Text-to-speech model<input id="tts_model"></label>
+      <label>Voice<select id="voice">
+        <option>alloy</option><option>ash</option><option>coral</option><option>echo</option>
+        <option>nova</option><option>onyx</option><option>sage</option><option>shimmer</option>
+      </select></label>
+      <label>AI instructions<textarea id="instructions" rows="5"></textarea></label>
+      <button>Save</button>
+    </form>
+    <div class="box">
+      <b>Test</b>
+      <input id="text" value="Hi" maxlength="300">
+      <button id="send">Send to AI</button>
+      <button id="speak">Speak (test voice)</button>
+      <p id="reply"></p>
+      <audio id="player" controls hidden></audio>
+    </div>
+  </section>
+</div>
+<p id="msg"></p>
+
+<script>
+// Change this to your Render address (no slash at the end). Never put the API key in this file.
+const API = "https://YOUR-SERVICE.onrender.com";
+const $ = id => document.getElementById(id);
+const FIELDS = ["chat_model", "stt_model", "tts_model", "voice", "instructions"];
+let password = "";
+
+async function call(path, method = "GET", body) {
+  const r = await fetch(API + "/api/admin" + path, {
+    method,
+    headers: { "Content-Type": "application/json", "X-Admin-Password": password },
+    body: body && JSON.stringify(body)
+  });
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || "Request failed");
+  return r.headers.get("Content-Type").startsWith("audio") ? r.blob() : r.json();
+}
+
+// run an action and show any error
+async function run(action) {
+  $("msg").textContent = "Please wait...";
+  try { await action(); $("msg").textContent = ""; }
+  catch (e) { $("msg").textContent = e.message; }
+}
+
+async function load() {
+  const d = await call("");
+  $("keyState").textContent = d.has_key ? "(key saved)" : "(no key yet)";
+  FIELDS.forEach(f => $(f).value = d.settings[f]);
+  $("list").replaceChildren(...d.devices.map(device => {
+    const box = document.createElement("div"), text = document.createElement("p"), remove = document.createElement("button");
+    box.className = "box";
+    text.textContent = `${device.name}\n${device.id} - ${device.online ? "online" : "offline"}`;
+    remove.textContent = "Remove";
+    remove.onclick = () => confirm("Remove this device?") && run(async () => {
+      await call("/devices/" + device.id, "DELETE"); await load();
+    });
+    box.append(text, remove);
+    return box;
+  }));
+}
+
+$("login").onsubmit = e => {
+  e.preventDefault();
+  password = $("password").value;
+  run(async () => { await load(); $("login").hidden = true; $("app").hidden = false; });
+};
+
+function tab(api) {
+  $("api").hidden = !api; $("devices").hidden = api;
+  $("tabApi").className = api ? "on" : ""; $("tabDevices").className = api ? "" : "on";
+}
+$("tabDevices").onclick = () => tab(false);
+$("tabApi").onclick = () => tab(true);
+
+$("add").onsubmit = e => {
+  e.preventDefault();
+  run(async () => {
+    const d = await call("/devices", "POST", { name: $("name").value });
+    $("newDevice").textContent = "Copy into the Arduino code now (the token is shown only once):\n\n" +
+      `#define PRODUCT_ID   "${d.product_id}"\n#define DEVICE_TOKEN "${d.token}"`;
+    $("name").value = "";
+    await load();
+  });
+};
+
+$("config").onsubmit = e => {
+  e.preventDefault();
+  const body = { api_key: $("api_key").value };
+  FIELDS.forEach(f => body[f] = $(f).value);
+  run(async () => { await call("/config", "POST", body); $("api_key").value = ""; await load(); });
+};
+
+$("send").onclick = () => run(async () => {
+  $("reply").textContent = "";
+  $("reply").textContent = (await call("/test", "POST", { text: $("text").value })).answer;
+});
+
+// speaks the AI reply if there is one, otherwise the typed text
+$("speak").onclick = () => run(async () => {
+  const sound = await call("/speak", "POST", { text: $("reply").textContent || $("text").value });
+  const p = $("player");
+  p.src = URL.createObjectURL(sound);
+  p.hidden = false;
+  await p.play().catch(() => {});   // some phones need a tap on the player
+});
+$("text").oninput = () => $("reply").textContent = "";
+</script>
+</body>
+</html>
