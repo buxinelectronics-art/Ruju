@@ -5,6 +5,11 @@
       "id": "faith",
       "name": "Faith",
       "count": 10
+    },
+    {
+      "id": "quran",
+      "name": "Quran",
+      "count": 10
     }
   ]
 }
