@@ -35,6 +35,11 @@
   .device-row .info span { font-size: 13px; color: #555; word-break: break-all; }
   .device-row .actions { display: flex; gap: 6px; flex-wrap: wrap; }
   .device-row .actions button { width: auto; margin: 0; min-width: 72px; }
+  .device-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .device-toolbar input { flex: 1 1 160px; margin: 0; }
+  .device-toolbar button { width: auto; margin: 0; }
+  .online { color: #060; }
+  .offline { color: #888; }
   .modal-bg {
     display: none; position: fixed; inset: 0; background: rgba(0,0,0,.45);
     z-index: 40; align-items: flex-end; justify-content: center; padding: 12px;
@@ -57,11 +62,14 @@
 <body>
 <h2>Admin Dashboard</h2>
 <form id="login">
-  <input id="password" type="password" placeholder="Admin password" required>
+  <input id="password" type="password" placeholder="Admin password" required autocomplete="current-password">
   <button>Log in</button>
 </form>
 
 <div id="app" hidden>
+  <p style="display:flex;justify-content:flex-end;margin:0 0 6px">
+    <button type="button" id="logout" style="width:auto;margin:0">Log out</button>
+  </p>
   <nav>
     <button type="button" data-tab="devices" class="on">Devices</button>
     <button type="button" data-tab="adhan">Adhan</button>
@@ -79,6 +87,10 @@
       <button>Add device</button>
       <p id="newDevice"></p>
     </form>
+    <div class="box device-toolbar">
+      <input id="deviceSearch" type="search" placeholder="Search name or product ID" autocomplete="off">
+      <button type="button" id="refreshDevices">Refresh status</button>
+    </div>
     <div id="list"></div>
   </section>
 
@@ -212,9 +224,10 @@
 
 <script>
 const API = "https://ruju-zxb0.onrender.com";
+const PW_KEY = "ruju_admin_pw";
 const $ = id => document.getElementById(id);
 const FIELDS = ["chat_model", "stt_model", "tts_model", "voice", "instructions"];
-let password = "";
+let password = sessionStorage.getItem(PW_KEY) || "";
 let meta = { methods: [], asr_options: [], high_lat: [] };
 let hadithRows = null, qaRows = null;
 let hurufBatchFiles = [];
@@ -222,6 +235,8 @@ let hurufLinkRows = null;
 let songsCache = [];
 let songsPending = []; // {file, link, title, artist, status, error, client_id}
 let storageInfo = { default: "github", providers: [] };
+let devicesCache = [];
+let checkingPid = null;
 
 async function call(path, method = "GET", body) {
   const r = await fetch(API + "/api/admin" + path, {
@@ -229,7 +244,16 @@ async function call(path, method = "GET", body) {
     headers: { "Content-Type": "application/json", "X-Admin-Password": password },
     body: body && JSON.stringify(body)
   });
-  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || "Request failed");
+  if (!r.ok) {
+    const err = (await r.json().catch(() => ({}))).error || "Request failed";
+    if (r.status === 401) {
+      sessionStorage.removeItem(PW_KEY);
+      password = "";
+      $("app").hidden = true;
+      $("login").hidden = false;
+    }
+    throw new Error(err);
+  }
   const ct = r.headers.get("Content-Type") || "";
   return ct.startsWith("audio") ? r.blob() : r.json();
 }
@@ -281,10 +305,20 @@ function closeDeviceModal() {
   $("deviceModalBg").classList.remove("open");
   $("deviceModalBody").replaceChildren();
 }
+function fmtSeen(device) {
+  if (device.online) return "online";
+  if (!device.last_seen) return "never seen";
+  const s = device.last_seen_ago;
+  if (s == null) return "offline";
+  if (s < 120) return "offline · seen " + s + "s ago";
+  if (s < 3600) return "offline · seen " + Math.floor(s / 60) + "m ago";
+  if (s < 86400) return "offline · seen " + Math.floor(s / 3600) + "h ago";
+  return "offline · seen " + Math.floor(s / 86400) + "d ago";
+}
 function openDeviceModal(device) {
   $("deviceModalTitle").textContent = device.name || "Device";
   $("deviceModalSub").textContent =
-    `${device.id} — ${device.online ? "online" : "offline"} (cfg v${device.config_version})`;
+    `${device.id} — ${fmtSeen(device)} (cfg v${device.config_version})`;
   const body = $("deviceModalBody");
   body.replaceChildren(deviceSettingsForm(device));
   $("deviceModalBg").classList.add("open");
@@ -353,26 +387,85 @@ function deviceCard(device) {
   const box = el("div", { class: "box device-row" });
   const info = el("div", { class: "info" });
   info.appendChild(el("strong", { text: device.name || "(unnamed)" }));
-  info.appendChild(el("span", {
-    text: `${device.id} · ${device.online ? "online" : "offline"} · cfg v${device.config_version}`
-  }));
+  const status = el("span", {
+    class: device.online ? "online" : "offline",
+    text: `${device.id} · ${fmtSeen(device)} · cfg v${device.config_version}`
+  });
+  info.appendChild(status);
   const actions = el("div", { class: "actions" });
+  const connect = el("button", {
+    type: "button",
+    text: checkingPid === device.id ? "Checking…" : (device.online ? "Recheck" : "Connect")
+  });
+  if (checkingPid === device.id) connect.disabled = true;
+  connect.onclick = () => checkDeviceOnline(device.id, connect);
   const view = el("button", { type: "button", text: "View" });
   view.onclick = () => openDeviceModal(device);
   const remove = el("button", { type: "button", text: "Remove" });
-  remove.onclick = () => confirm("Remove “" + (device.name || device.id) + "”?") && run(async () => {
+  remove.onclick = () => confirm("Remove “" + (device.name || device.id) + "”? This cannot be undone.") && run(async () => {
     await call("/devices/" + device.id, "DELETE");
     closeDeviceModal();
+    devicesCache = devicesCache.filter(d => d.id !== device.id);
+    renderDevices();
+    setMsg("Device removed.", true);
     await loadDevices();
   });
-  actions.append(view, remove);
+  actions.append(connect, view, remove);
   box.append(info, actions);
   return box;
+}
+function renderDevices() {
+  const q = ($("deviceSearch").value || "").trim().toLowerCase();
+  const filtered = !q ? devicesCache : devicesCache.filter(d =>
+    (d.name || "").toLowerCase().includes(q) || (d.id || "").toLowerCase().includes(q)
+  );
+  if (!filtered.length) {
+    $("list").replaceChildren(el("p", {
+      class: "hint",
+      text: devicesCache.length ? "No devices match that search." : "No devices yet. Add one above."
+    }));
+    return;
+  }
+  $("list").replaceChildren(...filtered.map(deviceCard));
+}
+async function checkDeviceOnline(pid, btn) {
+  if (checkingPid) return;
+  checkingPid = pid;
+  const label = btn ? btn.textContent : "Connect";
+  if (btn) { btn.disabled = true; btn.textContent = "Checking…"; }
+  const deadline = Date.now() + 45000;
+  try {
+    while (Date.now() < deadline) {
+      await loadDevices();
+      const d = devicesCache.find(x => x.id === pid);
+      if (d && d.online) {
+        setMsg((d.name || pid) + " is online.", true);
+        return;
+      }
+      if (btn) btn.textContent = "Waiting…";
+      await new Promise(r => setTimeout(r, 3000));
+    }
+    setMsg("Still offline. Power the device on and confirm Wi‑Fi + PRODUCT_ID / DEVICE_TOKEN.", false);
+  } catch (e) {
+    setMsg(e.message || "Check failed", false);
+  } finally {
+    checkingPid = null;
+    renderDevices();
+    if (btn && document.body.contains(btn)) {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+  }
 }
 $("deviceModalClose").onclick = () => closeDeviceModal();
 $("deviceModalBg").onclick = e => { if (e.target === $("deviceModalBg")) closeDeviceModal(); };
 document.addEventListener("keydown", e => {
   if (e.key === "Escape" && $("deviceModalBg").classList.contains("open")) closeDeviceModal();
+});
+$("deviceSearch").oninput = () => renderDevices();
+$("refreshDevices").onclick = () => run(async () => {
+  await loadDevices();
+  setMsg("Device status refreshed.", true);
 });
 
 async function loadDevices() {
@@ -382,8 +475,25 @@ async function loadDevices() {
   meta.high_lat = d.high_lat || meta.high_lat;
   $("keyState").textContent = d.has_key ? "(key saved)" : "(no key yet)";
   FIELDS.forEach(f => $(f).value = d.settings[f]);
-  $("list").replaceChildren(...d.devices.map(deviceCard));
+  devicesCache = d.devices || [];
+  renderDevices();
 }
+
+function enterApp() {
+  $("login").hidden = true;
+  $("app").hidden = false;
+}
+function logout() {
+  password = "";
+  sessionStorage.removeItem(PW_KEY);
+  $("password").value = "";
+  $("app").hidden = true;
+  $("login").hidden = false;
+  devicesCache = [];
+  $("list").replaceChildren();
+  $("msg").textContent = "";
+}
+$("logout").onclick = () => logout();
 
 function providerSelect(id) {
   const s = el("select", { id: id || undefined });
@@ -899,9 +1009,17 @@ $("login").onsubmit = e => {
   password = $("password").value;
   run(async () => {
     await loadDevices();
-    $("login").hidden = true; $("app").hidden = false;
+    sessionStorage.setItem(PW_KEY, password);
+    enterApp();
   });
 };
+if (password) {
+  $("password").value = password;
+  run(async () => {
+    await loadDevices();
+    enterApp();
+  });
+}
 $("add").onsubmit = e => {
   e.preventDefault();
   run(async () => {

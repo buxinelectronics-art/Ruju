@@ -121,6 +121,8 @@ def normalize_device(raw):
         out["config_version"] = 1
     return out
 
+ONLINE_SEC = 660  # device counts as online if hello within this window
+
 def load():
     if DATABASE_URL:
         row = database("SELECT data FROM store WHERE id=1")
@@ -129,11 +131,43 @@ def load():
         text = open("data.json").read() if os.path.exists("data.json") else None
     saved = json.loads(text) if text else {}
     devices = {pid: normalize_device(dev) for pid, dev in (saved.get("devices") or {}).items()}
-    return {"key": saved.get("key", ""), "settings": {**SETTINGS, **saved.get("settings", {})},
-            "devices": devices}
+    seen = {}
+    for pid, ts in (saved.get("last_seen") or {}).items():
+        try:
+            seen[str(pid)] = float(ts)
+        except (TypeError, ValueError):
+            pass
+    return {
+        "key": saved.get("key", ""),
+        "settings": {**SETTINGS, **saved.get("settings", {})},
+        "devices": devices,
+        "last_seen": seen,
+    }
+
+def apply_loaded(fresh):
+    """Replace in-memory store from disk/DB; keep newer last_seen timestamps."""
+    global data, last_seen
+    merged = dict(fresh.get("last_seen") or {})
+    for pid, ts in last_seen.items():
+        try:
+            ts = float(ts)
+        except (TypeError, ValueError):
+            continue
+        if ts > float(merged.get(pid, 0) or 0):
+            merged[pid] = ts
+    last_seen = merged
+    data = {
+        "key": fresh.get("key", ""),
+        "settings": fresh.get("settings", {**SETTINGS}),
+        "devices": fresh.get("devices", {}),
+    }
+
+def reload():
+    """Re-read store so multi-worker / multi-instance edits are not overwritten."""
+    apply_loaded(load())
 
 def save():
-    text = json.dumps(data)
+    text = json.dumps({**data, "last_seen": last_seen})
     if DATABASE_URL:
         database("INSERT INTO store VALUES (1,%s) ON CONFLICT (id) DO UPDATE SET data=EXCLUDED.data", (text,))
     else:
@@ -207,11 +241,20 @@ def validate_device_settings(d):
 
     return out, None
 
-def device_public(pid, d, online):
+def device_online(pid):
+    seen = float(last_seen.get(pid, 0) or 0)
+    return bool(seen) and (time.time() - seen) < ONLINE_SEC
+
+def device_public(pid, d, online=None):
+    seen = float(last_seen.get(pid, 0) or 0)
+    if online is None:
+        online = device_online(pid)
     return {
         "id": pid,
         "name": d["name"],
         "online": online,
+        "last_seen": int(seen) if seen else 0,
+        "last_seen_ago": int(time.time() - seen) if seen else None,
         "content_url": d["content_url"],
         "timezone": d["timezone"],
         "latitude": d["latitude"],
@@ -260,9 +303,16 @@ def hello_payload(d):
         "prayer_isha": 1 if d["prayer_isha"] else 0,
     }
 
-data = load()
+_boot = load()
+data = {
+    "key": _boot.get("key", ""),
+    "settings": _boot.get("settings", {**SETTINGS}),
+    "devices": _boot.get("devices", {}),
+}
+last_seen = dict(_boot.get("last_seen") or {})
+del _boot
 lock = threading.Lock()
-hits, last_seen, audio_store = {}, {}, {}
+hits, audio_store = {}, {}
 
 def too_many(key, limit, seconds):
     now = time.time()
@@ -340,15 +390,24 @@ def body():
 
 @app.get("/api/admin")
 def dashboard():
-    devices = [device_public(i, d, time.time() - last_seen.get(i, 0) < 660)
-               for i, d in data["devices"].items()]
-    return jsonify(has_key=bool(data["key"]), settings=data["settings"], devices=devices,
-                   methods=list(METHODS), asr_options=list(ASR_OPTIONS), high_lat=list(HIGH_LAT))
+    with lock:
+        reload()
+        devices = [device_public(i, d) for i, d in data["devices"].items()]
+        payload = dict(
+            has_key=bool(data["key"]),
+            settings=data["settings"],
+            devices=devices,
+            methods=list(METHODS),
+            asr_options=list(ASR_OPTIONS),
+            high_lat=list(HIGH_LAT),
+        )
+    return jsonify(payload)
 
 @app.post("/api/admin/config")
 def configure():
     d = body()
     with lock:
+        reload()
         key = str(d.get("api_key", "")).strip()
         if key:
             data["key"] = fernet.encrypt(key.encode()).decode()     # never sent back
@@ -366,6 +425,7 @@ def add_device():
         return error("Enter a device name", 400)
     pid, token = "QP-" + secrets.token_hex(4).upper(), secrets.token_urlsafe(32)
     with lock:
+        reload()
         data["devices"][pid] = normalize_device({
             **DEVICE_DEFAULTS,
             "name": name,
@@ -376,26 +436,31 @@ def add_device():
 
 @app.post("/api/admin/devices/<pid>/settings")
 def device_settings(pid):
-    if pid not in data["devices"]:
-        return error("Unknown device", 404)
     cleaned, err = validate_device_settings(body())
     if err:
         return error(err, 400)
     with lock:
+        reload()
+        if pid not in data["devices"]:
+            return error("Unknown device", 404)
         dev = data["devices"][pid]
         for key, value in cleaned.items():
             dev[key] = value
         dev["config_version"] = int(dev.get("config_version", 1)) + 1
         data["devices"][pid] = normalize_device(dev)
         save()
-        out = device_public(pid, data["devices"][pid], time.time() - last_seen.get(pid, 0) < 660)
+        out = device_public(pid, data["devices"][pid])
     return jsonify(ok=True, device=out)
 
 @app.delete("/api/admin/devices/<pid>")
 def remove_device(pid):
     with lock:
-        data["devices"].pop(pid, None)
+        reload()
+        existed = data["devices"].pop(pid, None) is not None
+        last_seen.pop(pid, None)
         save()
+    if not existed:
+        return error("Unknown device", 404)
     return jsonify(ok=True)
 
 @app.post("/api/admin/test")
@@ -464,6 +529,7 @@ def storage_set_default():
     if provider not in PROVIDERS:
         return error("audio_provider must be github, cloudinary, or s3", 400)
     with lock:
+        reload()
         data["settings"]["audio_provider"] = provider
         save()
     return jsonify(ok=True, default=provider)
@@ -1270,27 +1336,37 @@ def songs_delete(sid):
     return jsonify(ok=True, commit=sha, version=version, count=len(songs))
 
 # ---------- ESP32 ----------
-def device_id():
+def _auth_device_unlocked(persist_seen=False):
+    """Authenticate device. Caller must hold lock."""
     pid = request.headers.get("X-Product-ID", "")
     token = request.headers.get("Authorization", "").removeprefix("Bearer ")
+    reload()
     d = data["devices"].get(pid)
     ok = d and hmac.compare_digest(d["hash"], hashlib.sha256(token.encode()).hexdigest())
-    return pid if ok else None
+    if not ok:
+        return None
+    if persist_seen:
+        last_seen[pid] = time.time()
+        save()
+    return pid
+
+def device_id(persist_seen=False):
+    with lock:
+        return _auth_device_unlocked(persist_seen)
 
 @app.post("/api/device/hello")
 def hello():
-    pid = device_id()
-    if not pid:
-        return error("Bad device login", 401)
-    last_seen[pid] = time.time()
     with lock:
+        pid = _auth_device_unlocked(persist_seen=True)
+        if not pid:
+            return error("Bad device login", 401)
         data["devices"][pid] = normalize_device(data["devices"][pid])
         payload = hello_payload(data["devices"][pid])
     return jsonify(payload)
 
 @app.post("/api/device/ask")
 def ask():
-    pid = device_id()
+    pid = device_id(persist_seen=True)
     if not pid:
         return error("Bad device login", 401)
     if too_many("min:" + pid, 10, 60) or too_many("day:" + pid, 200, 86400):
@@ -1298,7 +1374,6 @@ def ask():
     audio = request.get_data()
     if audio[:4] != b"fLaC":
         return error("Bad audio", 400)
-    last_seen[pid] = time.time()
     question = openai("/audio/transcriptions", data={"model": data["settings"]["stt_model"], "language": "en"},
                       files={"file": ("q.flac", audio, "audio/flac")}).json().get("text", "").strip()[:300]
     if not question:
@@ -1315,7 +1390,7 @@ def ask():
 
 @app.get("/api/device/audio/<audio_id>")
 def get_audio(audio_id):
-    pid = device_id()
+    pid = device_id(persist_seen=False)
     saved = audio_store.get(pid)
     if not pid or not saved or saved[0] != audio_id:
         return error("Not found", 404)
