@@ -19,7 +19,17 @@
     {
       "id": "prayer",
       "name": "Prayer",
-      "count": 8
+      "count": 10
+    },
+    {
+      "id": "wudu",
+      "name": "Wudu",
+      "count": 6
+    },
+    {
+      "id": "fasting",
+      "name": "Fasting",
+      "count": 2
     }
   ]
 }
