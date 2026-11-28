@@ -12,6 +12,11 @@
   nav button.on { font-weight: bold; border-width: 3px; }
   .box { border: 1px solid #8888; border-radius: 8px; padding: 12px; margin: 12px 0; }
   .box p { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .row > * { flex: 1 1 120px; }
+  .checks label { display: inline-flex; align-items: center; gap: 6px; width: auto; margin-right: 10px; }
+  .checks input { width: auto; margin: 0; }
+  small { color: #555; }
 </style>
 </head>
 <body>
@@ -68,7 +73,15 @@
 const API = "https://ruju-zxb0.onrender.com";
 const $ = id => document.getElementById(id);
 const FIELDS = ["chat_model", "stt_model", "tts_model", "voice", "instructions"];
+const DEVICE_FIELDS = [
+  "content_url", "timezone", "latitude", "longitude", "method", "asr", "high_lat",
+  "adj_fajr", "adj_sunrise", "adj_dhuhr", "adj_asr", "adj_maghrib", "adj_isha",
+  "volume", "reciter"
+];
+const PRAYER_FIELDS = ["prayer_fajr", "prayer_dhuhr", "prayer_asr", "prayer_maghrib", "prayer_isha"];
 let password = "";
+let meta = { methods: ["MWL", "ISNA", "Egypt", "UmmAlQura", "Karachi"],
+             asr_options: ["Shafi", "Hanafi"], high_lat: ["None", "MidNight", "OneSeventh", "AngleBased"] };
 
 async function call(path, method = "GET", body) {
   const r = await fetch(API + "/api/admin" + path, {
@@ -80,28 +93,143 @@ async function call(path, method = "GET", body) {
   return r.headers.get("Content-Type").startsWith("audio") ? r.blob() : r.json();
 }
 
-// run an action and show any error
 async function run(action) {
   $("msg").textContent = "Please wait...";
   try { await action(); $("msg").textContent = ""; }
   catch (e) { $("msg").textContent = e.message; }
 }
 
+function fillSelect(sel, options, value) {
+  sel.replaceChildren();
+  options.forEach(opt => {
+    const o = document.createElement("option");
+    o.value = opt;
+    o.textContent = opt;
+    if (opt === value) o.selected = true;
+    sel.appendChild(o);
+  });
+}
+
+function deviceCard(device) {
+  const box = document.createElement("div");
+  box.className = "box";
+
+  const head = document.createElement("p");
+  head.textContent = `${device.name}\n${device.id} - ${device.online ? "online" : "offline"}  (cfg v${device.config_version})`;
+  box.appendChild(head);
+
+  const form = document.createElement("form");
+  const fields = document.createElement("div");
+
+  function labeled(labelText, el) {
+    const lab = document.createElement("label");
+    lab.textContent = labelText;
+    lab.appendChild(el);
+    return lab;
+  }
+  function num(name, value, step) {
+    const i = document.createElement("input");
+    i.name = name; i.type = "number"; i.value = value; i.step = step || "1";
+    return i;
+  }
+  function text(name, value) {
+    const i = document.createElement("input");
+    i.name = name; i.type = "text"; i.value = value;
+    return i;
+  }
+  function sel(name, options, value) {
+    const s = document.createElement("select");
+    s.name = name;
+    fillSelect(s, options, value);
+    return s;
+  }
+
+  fields.append(
+    labeled("Content URL", text("content_url", device.content_url)),
+    labeled("Timezone (POSIX)", text("timezone", device.timezone)),
+    (() => { const tip = document.createElement("small"); tip.textContent = "Examples: GMT0, GMT-3, WAT-1, PST8PDT,M3.2.0,M11.1.0"; return tip; })()
+  );
+
+  const geo = document.createElement("div");
+  geo.className = "row";
+  geo.append(labeled("Latitude", num("latitude", device.latitude, "any")),
+             labeled("Longitude", num("longitude", device.longitude, "any")));
+  fields.appendChild(geo);
+
+  fields.append(
+    labeled("Method", sel("method", meta.methods, device.method)),
+    labeled("Asr", sel("asr", meta.asr_options, device.asr)),
+    labeled("High latitude", sel("high_lat", meta.high_lat, device.high_lat))
+  );
+
+  const adj = document.createElement("div");
+  adj.className = "row";
+  [["adj_fajr","Fajr"],["adj_sunrise","Sunrise"],["adj_dhuhr","Dhuhr"],
+   ["adj_asr","Asr"],["adj_maghrib","Maghrib"],["adj_isha","Isha"]].forEach(([k, lab]) => {
+    adj.appendChild(labeled(lab + " adj", num(k, device[k])));
+  });
+  fields.appendChild(adj);
+
+  const checks = document.createElement("div");
+  checks.className = "checks";
+  checks.appendChild(document.createTextNode("Adhan on: "));
+  [["prayer_fajr","Fajr"],["prayer_dhuhr","Dhuhr"],["prayer_asr","Asr"],
+   ["prayer_maghrib","Maghrib"],["prayer_isha","Isha"]].forEach(([k, lab]) => {
+    const labEl = document.createElement("label");
+    const c = document.createElement("input");
+    c.type = "checkbox"; c.name = k; c.checked = !!device[k];
+    labEl.append(c, document.createTextNode(lab));
+    checks.appendChild(labEl);
+  });
+  fields.appendChild(checks);
+
+  const remote = document.createElement("div");
+  remote.className = "row";
+  remote.append(
+    labeled("Volume (-1 keep)", num("volume", device.volume)),
+    labeled("Reciter (-1 keep)", num("reciter", device.reciter))
+  );
+  fields.appendChild(remote);
+
+  const saveBtn = document.createElement("button");
+  saveBtn.textContent = "Save device settings";
+  form.append(fields, saveBtn);
+  form.onsubmit = e => {
+    e.preventDefault();
+    const fd = new FormData(form);
+    const body = {};
+    DEVICE_FIELDS.forEach(k => body[k] = fd.get(k));
+    PRAYER_FIELDS.forEach(k => body[k] = form.elements[k].checked);
+    body.latitude = Number(body.latitude);
+    body.longitude = Number(body.longitude);
+    ["volume", "reciter", ...DEVICE_FIELDS.filter(k => k.startsWith("adj_"))].forEach(k => {
+      body[k] = Number(body[k]);
+    });
+    run(async () => {
+      await call("/devices/" + device.id + "/settings", "POST", body);
+      await load();
+    });
+  };
+  box.appendChild(form);
+
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.textContent = "Remove";
+  remove.onclick = () => confirm("Remove this device?") && run(async () => {
+    await call("/devices/" + device.id, "DELETE"); await load();
+  });
+  box.appendChild(remove);
+  return box;
+}
+
 async function load() {
   const d = await call("");
+  meta.methods = d.methods || meta.methods;
+  meta.asr_options = d.asr_options || meta.asr_options;
+  meta.high_lat = d.high_lat || meta.high_lat;
   $("keyState").textContent = d.has_key ? "(key saved)" : "(no key yet)";
   FIELDS.forEach(f => $(f).value = d.settings[f]);
-  $("list").replaceChildren(...d.devices.map(device => {
-    const box = document.createElement("div"), text = document.createElement("p"), remove = document.createElement("button");
-    box.className = "box";
-    text.textContent = `${device.name}\n${device.id} - ${device.online ? "online" : "offline"}`;
-    remove.textContent = "Remove";
-    remove.onclick = () => confirm("Remove this device?") && run(async () => {
-      await call("/devices/" + device.id, "DELETE"); await load();
-    });
-    box.append(text, remove);
-    return box;
-  }));
+  $("list").replaceChildren(...d.devices.map(deviceCard));
 }
 
 $("login").onsubmit = e => {
@@ -140,13 +268,12 @@ $("send").onclick = () => run(async () => {
   $("reply").textContent = (await call("/test", "POST", { text: $("text").value })).answer;
 });
 
-// speaks the AI reply if there is one, otherwise the typed text
 $("speak").onclick = () => run(async () => {
   const sound = await call("/speak", "POST", { text: $("reply").textContent || $("text").value });
   const p = $("player");
   p.src = URL.createObjectURL(sound);
   p.hidden = false;
-  await p.play().catch(() => {});   // some phones need a tap on the player
+  await p.play().catch(() => {});
 });
 $("text").oninput = () => $("reply").textContent = "";
 </script>

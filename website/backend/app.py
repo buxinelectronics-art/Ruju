@@ -8,6 +8,9 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 ADMIN_PASSWORD = os.environ["ADMIN_PASSWORD"]
 SECRET_KEY = os.environ["SECRET_KEY"]
 DATABASE_URL = os.getenv("DATABASE_URL")        # Neon (keeps data after restarts)
+DEFAULT_CONTENT_URL = os.getenv(
+    "DEFAULT_CONTENT_URL", "https://buxinelectronics-art.github.io/Ruju"
+).rstrip("/")
 fernet = Fernet(base64.urlsafe_b64encode(hashlib.sha256(SECRET_KEY.encode()).digest()))
 
 app = Flask(__name__)
@@ -27,6 +30,36 @@ SETTINGS = {
     "at most 60 words, plain text. Never invent verses or hadith. For personal rulings, advise asking a scholar.",
 }
 
+METHODS = ("MWL", "ISNA", "Egypt", "UmmAlQura", "Karachi")
+ASR_OPTIONS = ("Shafi", "Hanafi")
+HIGH_LAT = ("None", "MidNight", "OneSeventh", "AngleBased")
+ADJ_KEYS = ("adj_fajr", "adj_sunrise", "adj_dhuhr", "adj_asr", "adj_maghrib", "adj_isha")
+PRAYER_KEYS = ("prayer_fajr", "prayer_dhuhr", "prayer_asr", "prayer_maghrib", "prayer_isha")
+
+DEVICE_DEFAULTS = {
+    "content_url": DEFAULT_CONTENT_URL,
+    "timezone": "GMT0",
+    "latitude": 21.4225,
+    "longitude": 39.8262,
+    "method": "MWL",
+    "asr": "Shafi",
+    "high_lat": "None",
+    "adj_fajr": 0,
+    "adj_sunrise": 0,
+    "adj_dhuhr": 0,
+    "adj_asr": 0,
+    "adj_maghrib": 0,
+    "adj_isha": 0,
+    "prayer_fajr": True,
+    "prayer_dhuhr": True,
+    "prayer_asr": True,
+    "prayer_maghrib": True,
+    "prayer_isha": True,
+    "volume": -1,
+    "reciter": -1,
+    "config_version": 1,
+}
+
 # ---------- storage: one JSON document in Neon, or a local file ----------
 def database(sql, args=()):
     import psycopg
@@ -35,6 +68,51 @@ def database(sql, args=()):
         cur = c.execute(sql, args)
         return cur.fetchone() if cur.description else None
 
+def normalize_device(raw):
+    if not isinstance(raw, dict):
+        raw = {}
+    out = {**DEVICE_DEFAULTS}
+    out["name"] = str(raw.get("name", ""))[:60]
+    out["hash"] = str(raw.get("hash", ""))
+    for key, default in DEVICE_DEFAULTS.items():
+        if key not in raw:
+            continue
+        out[key] = raw[key]
+    # keep types sane even if old data is messy
+    out["content_url"] = str(out.get("content_url") or DEFAULT_CONTENT_URL).rstrip("/")[:200]
+    out["timezone"] = str(out.get("timezone") or "GMT0")[:40]
+    try:
+        out["latitude"] = float(out["latitude"])
+        out["longitude"] = float(out["longitude"])
+    except (TypeError, ValueError):
+        out["latitude"], out["longitude"] = DEVICE_DEFAULTS["latitude"], DEVICE_DEFAULTS["longitude"]
+    if out.get("method") not in METHODS:
+        out["method"] = "MWL"
+    if out.get("asr") not in ASR_OPTIONS:
+        out["asr"] = "Shafi"
+    if out.get("high_lat") not in HIGH_LAT:
+        out["high_lat"] = "None"
+    for key in ADJ_KEYS:
+        try:
+            out[key] = max(-90, min(90, int(out[key])))
+        except (TypeError, ValueError):
+            out[key] = 0
+    for key in PRAYER_KEYS:
+        out[key] = bool(out.get(key, True))
+    try:
+        out["volume"] = int(out.get("volume", -1))
+    except (TypeError, ValueError):
+        out["volume"] = -1
+    try:
+        out["reciter"] = int(out.get("reciter", -1))
+    except (TypeError, ValueError):
+        out["reciter"] = -1
+    try:
+        out["config_version"] = max(1, int(out.get("config_version", 1)))
+    except (TypeError, ValueError):
+        out["config_version"] = 1
+    return out
+
 def load():
     if DATABASE_URL:
         row = database("SELECT data FROM store WHERE id=1")
@@ -42,8 +120,9 @@ def load():
     else:
         text = open("data.json").read() if os.path.exists("data.json") else None
     saved = json.loads(text) if text else {}
+    devices = {pid: normalize_device(dev) for pid, dev in (saved.get("devices") or {}).items()}
     return {"key": saved.get("key", ""), "settings": {**SETTINGS, **saved.get("settings", {})},
-            "devices": saved.get("devices", {})}
+            "devices": devices}
 
 def save():
     text = json.dumps(data)
@@ -51,6 +130,127 @@ def save():
         database("INSERT INTO store VALUES (1,%s) ON CONFLICT (id) DO UPDATE SET data=EXCLUDED.data", (text,))
     else:
         open("data.json", "w").write(text)
+
+def validate_device_settings(d):
+    out = {}
+    url = str(d.get("content_url", "")).strip().rstrip("/")
+    if not url.startswith("https://") or len(url) > 200:
+        return None, "content_url must be https://... (max 200 chars)"
+    out["content_url"] = url
+
+    tz = str(d.get("timezone", "")).strip()
+    if not tz or len(tz) > 40 or any(c in tz for c in " \t\r\n\"'"):
+        return None, "timezone must be a POSIX string (no spaces), max 40 chars"
+    out["timezone"] = tz
+
+    try:
+        lat = float(d.get("latitude"))
+        lon = float(d.get("longitude"))
+    except (TypeError, ValueError):
+        return None, "latitude and longitude must be numbers"
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return None, "latitude/longitude out of range"
+    out["latitude"], out["longitude"] = lat, lon
+
+    method = str(d.get("method", "")).strip()
+    if method not in METHODS:
+        return None, "method must be one of: " + ", ".join(METHODS)
+    out["method"] = method
+
+    asr = str(d.get("asr", "")).strip()
+    if asr not in ASR_OPTIONS:
+        return None, "asr must be Shafi or Hanafi"
+    out["asr"] = asr
+
+    high = str(d.get("high_lat", "")).strip()
+    if high not in HIGH_LAT:
+        return None, "high_lat must be one of: " + ", ".join(HIGH_LAT)
+    out["high_lat"] = high
+
+    for key in ADJ_KEYS:
+        try:
+            val = int(d.get(key, 0))
+        except (TypeError, ValueError):
+            return None, key + " must be an integer minute adjustment"
+        if val < -90 or val > 90:
+            return None, key + " must be between -90 and 90"
+        out[key] = val
+
+    for key in PRAYER_KEYS:
+        out[key] = bool(d.get(key, True))
+
+    if "volume" in d and d.get("volume") is not None and str(d.get("volume")).strip() != "":
+        try:
+            vol = int(d.get("volume"))
+        except (TypeError, ValueError):
+            return None, "volume must be -1 or 5..100"
+        if vol != -1 and not (5 <= vol <= 100):
+            return None, "volume must be -1 or 5..100"
+        out["volume"] = vol
+
+    if "reciter" in d and d.get("reciter") is not None and str(d.get("reciter")).strip() != "":
+        try:
+            rec = int(d.get("reciter"))
+        except (TypeError, ValueError):
+            return None, "reciter must be -1 or 0..3"
+        if rec != -1 and not (0 <= rec <= 3):
+            return None, "reciter must be -1 or 0..3"
+        out["reciter"] = rec
+
+    return out, None
+
+def device_public(pid, d, online):
+    return {
+        "id": pid,
+        "name": d["name"],
+        "online": online,
+        "content_url": d["content_url"],
+        "timezone": d["timezone"],
+        "latitude": d["latitude"],
+        "longitude": d["longitude"],
+        "method": d["method"],
+        "asr": d["asr"],
+        "high_lat": d["high_lat"],
+        "adj_fajr": d["adj_fajr"],
+        "adj_sunrise": d["adj_sunrise"],
+        "adj_dhuhr": d["adj_dhuhr"],
+        "adj_asr": d["adj_asr"],
+        "adj_maghrib": d["adj_maghrib"],
+        "adj_isha": d["adj_isha"],
+        "prayer_fajr": d["prayer_fajr"],
+        "prayer_dhuhr": d["prayer_dhuhr"],
+        "prayer_asr": d["prayer_asr"],
+        "prayer_maghrib": d["prayer_maghrib"],
+        "prayer_isha": d["prayer_isha"],
+        "volume": d["volume"],
+        "reciter": d["reciter"],
+        "config_version": d["config_version"],
+    }
+
+def hello_payload(d):
+    return {
+        "config_version": d["config_version"],
+        "volume": d["volume"],
+        "reciter": d["reciter"],
+        "content_url": d["content_url"],
+        "timezone": d["timezone"],
+        "latitude": d["latitude"],
+        "longitude": d["longitude"],
+        "method": d["method"],
+        "asr": d["asr"],
+        "high_lat": d["high_lat"],
+        "adj_fajr": d["adj_fajr"],
+        "adj_sunrise": d["adj_sunrise"],
+        "adj_dhuhr": d["adj_dhuhr"],
+        "adj_asr": d["adj_asr"],
+        "adj_maghrib": d["adj_maghrib"],
+        "adj_isha": d["adj_isha"],
+        "prayer_fajr": 1 if d["prayer_fajr"] else 0,
+        "prayer_dhuhr": 1 if d["prayer_dhuhr"] else 0,
+        "prayer_asr": 1 if d["prayer_asr"] else 0,
+        "prayer_maghrib": 1 if d["prayer_maghrib"] else 0,
+        "prayer_isha": 1 if d["prayer_isha"] else 0,
+    }
 
 data = load()
 lock = threading.Lock()
@@ -123,9 +323,10 @@ def body():
 
 @app.get("/api/admin")
 def dashboard():
-    devices = [{"id": i, "name": d["name"], "online": time.time() - last_seen.get(i, 0) < 660}
+    devices = [device_public(i, d, time.time() - last_seen.get(i, 0) < 660)
                for i, d in data["devices"].items()]
-    return jsonify(has_key=bool(data["key"]), settings=data["settings"], devices=devices)
+    return jsonify(has_key=bool(data["key"]), settings=data["settings"], devices=devices,
+                   methods=list(METHODS), asr_options=list(ASR_OPTIONS), high_lat=list(HIGH_LAT))
 
 @app.post("/api/admin/config")
 def configure():
@@ -148,9 +349,30 @@ def add_device():
         return error("Enter a device name", 400)
     pid, token = "QP-" + secrets.token_hex(4).upper(), secrets.token_urlsafe(32)
     with lock:
-        data["devices"][pid] = {"name": name, "hash": hashlib.sha256(token.encode()).hexdigest()}
+        data["devices"][pid] = normalize_device({
+            **DEVICE_DEFAULTS,
+            "name": name,
+            "hash": hashlib.sha256(token.encode()).hexdigest(),
+        })
         save()
     return jsonify(product_id=pid, token=token)                      # token shown once
+
+@app.post("/api/admin/devices/<pid>/settings")
+def device_settings(pid):
+    if pid not in data["devices"]:
+        return error("Unknown device", 404)
+    cleaned, err = validate_device_settings(body())
+    if err:
+        return error(err, 400)
+    with lock:
+        dev = data["devices"][pid]
+        for key, value in cleaned.items():
+            dev[key] = value
+        dev["config_version"] = int(dev.get("config_version", 1)) + 1
+        data["devices"][pid] = normalize_device(dev)
+        save()
+        out = device_public(pid, data["devices"][pid], time.time() - last_seen.get(pid, 0) < 660)
+    return jsonify(ok=True, device=out)
 
 @app.delete("/api/admin/devices/<pid>")
 def remove_device(pid):
@@ -183,7 +405,10 @@ def hello():
     if not pid:
         return error("Bad device login", 401)
     last_seen[pid] = time.time()
-    return jsonify(config_version=1, volume=-1, reciter=-1)
+    with lock:
+        data["devices"][pid] = normalize_device(data["devices"][pid])
+        payload = hello_payload(data["devices"][pid])
+    return jsonify(payload)
 
 @app.post("/api/device/ask")
 def ask():
