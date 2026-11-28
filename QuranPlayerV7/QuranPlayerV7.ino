@@ -1,9 +1,13 @@
 /*
  * Quran Player V7 — buffered multi-task player + voice "Deen AI" (ESP32-C3)
  *
- * ARDUINO IDE SETTINGS
- *   Board package     : esp32 by Espressif, 3.3.x
- *   Partition Scheme  : Huge APP (3MB No OTA/1MB SPIFFS)
+ * ARDUINO IDE SETTINGS (Tools menu)
+ *   Board             : ESP32C3 Dev Module (or your ESP32-C3 board)
+ *   Board package     : esp32 by Espressif Systems
+ *   Partition Scheme  : Huge APP (3MB No OTA / 1MB SPIFFS)   << REQUIRED
+ *                       (default ~1.2MB app is TOO SMALL — you will see
+ *                        "Sketch too big" / "text section exceeds available space")
+ *                       Alternative that also fits: Minimal SPIFFS (1.9MB APP with OTA)
  *   USB CDC On Boot   : Enabled   (REQUIRED to see Serial logs; GPIO20/21 are
  *                                  used by I2S, so UART Serial cannot be used)
  * LIBRARIES
