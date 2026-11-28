@@ -173,6 +173,42 @@ def save():
     else:
         open("data.json", "w").write(text)
 
+_seen_dirty = False
+_seen_flush_at = 0.0
+
+def flush_last_seen():
+    """Persist last_seen without clobbering newer device rows from another worker."""
+    global last_seen, _seen_dirty, _seen_flush_at
+    if not _seen_dirty:
+        return
+    fresh = load()
+    merged = dict(fresh.get("last_seen") or {})
+    for pid, ts in last_seen.items():
+        try:
+            ts = float(ts)
+        except (TypeError, ValueError):
+            continue
+        if ts > float(merged.get(pid, 0) or 0):
+            merged[pid] = ts
+    # Keep devices/settings from DB so a stale worker cannot revive deleted devices.
+    payload = {
+        "key": fresh.get("key", ""),
+        "settings": fresh.get("settings", {**SETTINGS}),
+        "devices": fresh.get("devices", {}),
+        "last_seen": merged,
+    }
+    text = json.dumps(payload)
+    if DATABASE_URL:
+        database("INSERT INTO store VALUES (1,%s) ON CONFLICT (id) DO UPDATE SET data=EXCLUDED.data", (text,))
+    else:
+        open("data.json", "w").write(text)
+    last_seen = merged
+    data["key"] = payload["key"]
+    data["settings"] = payload["settings"]
+    data["devices"] = payload["devices"]
+    _seen_dirty = False
+    _seen_flush_at = time.time()
+
 def validate_device_settings(d):
     out = {}
     url = str(d.get("content_url", "")).strip().rstrip("/")
@@ -331,15 +367,27 @@ def openai(path, **kw):
     if not data["key"]:
         raise AIError("No API key saved")
     key = fernet.decrypt(data["key"].encode()).decode()
-    try:
-        r = requests.post("https://api.openai.com/v1" + path, timeout=40,
-                          headers={"Authorization": "Bearer " + key}, **kw)
-    except requests.RequestException:
-        raise AIError("OpenAI unreachable")
-    if not r.ok:
-        app.logger.warning("OpenAI %s %s %s", path, r.status_code, r.text[:300])
-        raise AIError({401: "Wrong API key", 429: "No credit or busy"}.get(r.status_code, f"OpenAI error {r.status_code}"))
-    return r
+    last_err = "OpenAI unreachable"
+    for attempt in range(8):
+        try:
+            r = requests.post("https://api.openai.com/v1" + path, timeout=60,
+                              headers={"Authorization": "Bearer " + key}, **kw)
+        except requests.RequestException:
+            if attempt == 7:
+                raise AIError("OpenAI unreachable")
+            time.sleep(1 + attempt)
+            continue
+        if r.status_code == 429:
+            last_err = "No credit or busy"
+            app.logger.warning("OpenAI rate limit %s attempt %s", path, attempt + 1)
+            time.sleep(min(45, 2 ** attempt))
+            continue
+        if not r.ok:
+            app.logger.warning("OpenAI %s %s %s", path, r.status_code, r.text[:300])
+            raise AIError({401: "Wrong API key", 429: "No credit or busy"}.get(
+                r.status_code, f"OpenAI error {r.status_code}"))
+        return r
+    raise AIError(last_err)
 
 def chat(text):
     s = data["settings"]
@@ -367,9 +415,13 @@ def home():
 # ---------- admin dashboard ----------
 @app.before_request
 def admin_login():
-    # Songs uploads may be up to 10 MB; keep other routes at 8 MB.
+    # Songs uploads may be up to 10 MB; Excel previews up to 20 MB; else 8 MB.
     if request.path.startswith("/api/admin/songs"):
         app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024 + 256 * 1024
+    elif "/preview" in request.path and (
+        request.path.startswith("/api/admin/qa") or request.path.startswith("/api/admin/hadith")
+    ):
+        app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024 + 256 * 1024
     else:
         app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
     if request.path.startswith("/api/admin") and request.method != "OPTIONS":
@@ -391,6 +443,10 @@ def body():
 @app.get("/api/admin")
 def dashboard():
     with lock:
+        try:
+            flush_last_seen()
+        except Exception:
+            app.logger.exception("flush_last_seen failed")
         reload()
         devices = [device_public(i, d) for i, d in data["devices"].items()]
         payload = dict(
@@ -782,8 +838,8 @@ def hadith_preview():
     if not f:
         return error("Choose an .xlsx file", 400)
     raw = f.read()
-    if len(raw) > 2 * 1024 * 1024:
-        return error("Excel file too large", 400)
+    if len(raw) > 20 * 1024 * 1024:
+        return error("Excel file too large (max 20 MB)", 400)
     rows, errors = gh.parse_hadith_xlsx(raw)
     return jsonify(ok=not errors, rows=rows, errors=errors, count=len(rows))
 
@@ -858,6 +914,12 @@ def _publish_hadith(jid, rows):
             meta = {"number": num, "title": row["title"], "hash": row["hash"], "file": stem}
             meta.update({k: audio_meta[k] for k in ("provider", "key", "url") if audio_meta.get(k)})
             items_meta.append(meta)
+            # Mid-save every 10 so a long TTS run does not lose everything on failure.
+            if (i + 1) % 10 == 0:
+                idx = {"version": version, "count": len(items_meta), "items": items_meta}
+                files["website/docs/hadith/index.json"] = json.dumps(idx, ensure_ascii=True, indent=2).encode()
+                _job_set(jid, progress=f"saved {i + 1}/{len(rows)}", done=i + 1)
+                gh.atomic_update(dict(files), f"Hadith progress {i + 1}/{len(rows)}")
         index = {"version": version, "count": len(items_meta), "items": items_meta}
         files["website/docs/hadith/index.json"] = json.dumps(index, ensure_ascii=True, indent=2).encode()
         _job_set(jid, progress="committing to GitHub")
@@ -870,6 +932,13 @@ def _publish_hadith(jid, rows):
         _job_set(jid, status="done", ok=True, progress="done", done=len(rows), commit=sha, version=version)
     except Exception as ex:
         app.logger.exception("hadith publish failed")
+        try:
+            if files:
+                index = {"version": version, "count": len(items_meta), "items": items_meta}
+                files["website/docs/hadith/index.json"] = json.dumps(index, ensure_ascii=True, indent=2).encode()
+                gh.atomic_update(dict(files), f"Hadith partial save ({len(items_meta)} items)")
+        except Exception:
+            app.logger.exception("hadith partial save failed")
         _job_set(jid, status="error", error=str(ex), progress="failed")
 
 @app.post("/api/admin/hadith/publish")
@@ -880,9 +949,6 @@ def hadith_publish():
     rows = d.get("rows")
     if not isinstance(rows, list) or not rows:
         return error("rows required", 400)
-    # re-validate lightly
-    if len(rows) > 500:
-        return error("Max 500 rows", 400)
     jid = _job_new("hadith")
     threading.Thread(target=_publish_hadith, args=(jid, rows), daemon=True).start()
     return jsonify(job_id=jid)
@@ -918,12 +984,38 @@ def qa_preview():
     if not f:
         return error("Choose an .xlsx file", 400)
     raw = f.read()
-    if len(raw) > 2 * 1024 * 1024:
-        return error("Excel file too large", 400)
+    if len(raw) > 20 * 1024 * 1024:
+        return error("Excel file too large (max 20 MB)", 400)
     rows, errors = gh.parse_qa_xlsx(raw)
     return jsonify(ok=not errors, rows=rows, errors=errors, count=len(rows))
 
 def _publish_qa(jid, rows):
+    """TTS + upload Q&A. Saves to GitHub every 10 items so large batches survive mid-job failures."""
+    files = {}
+    pending = {}
+    version = 1
+    done = 0
+    topics_order = []
+    processed = {}
+    topic_names = {}
+
+    def partial_index():
+        topics_meta = [{"id": tid, "name": topic_names[tid], "count": processed[tid]}
+                       for tid, _ in topics_order if processed.get(tid)]
+        return {"version": version, "topics": topics_meta}
+
+    def flush(msg):
+        nonlocal pending
+        if not pending and "website/docs/qa/index.json" not in files:
+            return None
+        idx_bytes = json.dumps(partial_index(), ensure_ascii=True, indent=2).encode()
+        pending["website/docs/qa/index.json"] = idx_bytes
+        files["website/docs/qa/index.json"] = idx_bytes
+        _job_set(jid, progress=msg, done=done)
+        sha = gh.atomic_update(pending, msg)
+        pending = {}
+        return sha
+
     try:
         _job_set(jid, progress="loading live index", total=len(rows))
         old = gh.load_qa_index()
@@ -938,57 +1030,63 @@ def _publish_qa(jid, rows):
                 obj = json.loads(raw.decode())
                 h = gh.row_hash(tid, obj.get("question", ""), obj.get("answer", ""), obj.get("source", ""))
                 old_hash[(tid, n)] = h
-        # group by topic preserving order
-        topics_order = []
         by_topic = {}
         for row in rows:
             tid = row["topic_id"]
             if tid not in by_topic:
                 by_topic[tid] = []
                 topics_order.append((tid, row["topic"]))
+                topic_names[tid] = row["topic"]
+                processed[tid] = 0
             by_topic[tid].append(row)
-        files = {}
         version = int(old.get("version") or 0) + 1
-        topics_meta = []
-        done = 0
-        for tid, tname in topics_order:
+        for tid, _tname in topics_order:
             items = by_topic[tid]
-            topics_meta.append({"id": tid, "name": tname, "count": len(items)})
             for n, row in enumerate(items, start=1):
                 done += 1
                 json_obj = {"question": row["question"], "answer": row["answer"], "source": row["source"]}
                 json_bytes = json.dumps(json_obj, ensure_ascii=True, separators=(",", ":")).encode()
-                mp3_path = f"website/docs/qa/{tid}/{n:03d}.mp3"
+                stem = f"{n:03d}"
+                json_path = f"website/docs/qa/{tid}/{stem}.json"
+                mp3_path = f"website/docs/qa/{tid}/{stem}.mp3"
                 reuse = old_hash.get((tid, n)) == row["hash"]
+                mp3 = None
                 if reuse:
-                    existing = gh.get_file_bytes(mp3_path)
-                    if not existing:
+                    mp3 = gh.get_file_bytes(mp3_path)
+                    if not mp3:
                         reuse = False
                 if reuse:
-                    mp3 = existing
                     _job_set(jid, progress=f"reuse {done}/{len(rows)}", done=done)
                 else:
                     _job_set(jid, progress=f"TTS {done}/{len(rows)}", done=done - 1)
                     speak = row["question"].rstrip(".?") + "? ... " + row["answer"]
-                    for attempt in range(3):
-                        try:
-                            mp3 = tts(speak[:4000])
-                            break
-                        except Exception:
-                            if attempt == 2:
-                                raise
-                            time.sleep(1 + attempt)
+                    mp3 = tts(speak[:4000])
                     _job_set(jid, progress=f"TTS done {done}/{len(rows)}", done=done)
-                files[f"website/docs/qa/{tid}/{n:03d}.json"] = json_bytes
+                files[json_path] = json_bytes
                 files[mp3_path] = mp3
-        index = {"version": version, "topics": topics_meta}
-        files["website/docs/qa/index.json"] = json.dumps(index, ensure_ascii=True, indent=2).encode()
-        _job_set(jid, progress="committing to GitHub")
+                pending[json_path] = json_bytes
+                pending[mp3_path] = mp3
+                processed[tid] = n
+                if done % 10 == 0:
+                    flush(f"saved {done}/{len(rows)}")
+        _job_set(jid, progress="finalizing on GitHub", done=done)
+        files["website/docs/qa/index.json"] = json.dumps(
+            {"version": version, "topics": [
+                {"id": tid, "name": topic_names[tid], "count": len(by_topic[tid])}
+                for tid, _ in topics_order
+            ]},
+            ensure_ascii=True, indent=2,
+        ).encode()
         sha = gh.atomic_replace("website/docs/qa/", files, f"Publish Q&A v{version} ({len(rows)} items)")
         _job_set(jid, status="done", ok=True, progress="done", done=len(rows), commit=sha, version=version)
     except Exception as ex:
         app.logger.exception("qa publish failed")
-        _job_set(jid, status="error", error=str(ex), progress="failed")
+        try:
+            if files:
+                flush(f"partial save after error ({done}/{len(rows)})")
+        except Exception:
+            app.logger.exception("qa partial save failed")
+        _job_set(jid, status="error", error=str(ex), progress="failed", done=done)
 
 @app.post("/api/admin/qa/publish")
 def qa_publish():
@@ -997,8 +1095,6 @@ def qa_publish():
     rows = body().get("rows")
     if not isinstance(rows, list) or not rows:
         return error("rows required", 400)
-    if len(rows) > 500:
-        return error("Max 500 rows", 400)
     jid = _job_new("qa")
     threading.Thread(target=_publish_qa, args=(jid, rows), daemon=True).start()
     return jsonify(job_id=jid)
@@ -1336,19 +1432,53 @@ def songs_delete(sid):
     return jsonify(ok=True, commit=sha, version=version, count=len(songs))
 
 # ---------- ESP32 ----------
+def _parse_device_auth():
+    pid = (request.headers.get("X-Product-ID") or "").strip()
+    auth = (request.headers.get("Authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        token = auth[7:].strip()
+    else:
+        token = auth.strip()
+    return pid, token
+
+def _token_ok(dev, token: str) -> bool:
+    expected = str((dev or {}).get("hash") or "")
+    got = hashlib.sha256(token.encode()).hexdigest()
+    return bool(dev) and len(expected) == len(got) and hmac.compare_digest(expected, got)
+
 def _auth_device_unlocked(persist_seen=False):
-    """Authenticate device. Caller must hold lock."""
-    pid = request.headers.get("X-Product-ID", "")
-    token = request.headers.get("Authorization", "").removeprefix("Bearer ")
-    reload()
-    d = data["devices"].get(pid)
-    ok = d and hmac.compare_digest(d["hash"], hashlib.sha256(token.encode()).hexdigest())
-    if not ok:
+    """Authenticate device. Caller must hold lock. Fast path avoids DB on every hello."""
+    global _seen_dirty, _seen_flush_at
+    pid, token = _parse_device_auth()
+    if not pid or not token:
         return None
+    d = data["devices"].get(pid)
+    if not _token_ok(d, token):
+        # Newly added device / other worker — refresh once, then retry.
+        try:
+            reload()
+        except Exception:
+            app.logger.exception("device auth reload failed")
+            return None
+        d = data["devices"].get(pid)
+        if not _token_ok(d, token):
+            return None
     if persist_seen:
         last_seen[pid] = time.time()
-        save()
+        _seen_dirty = True
+        # Persist in the background so ESP32 hello stays fast (Render/Neon can be slow).
+        now = time.time()
+        if now - _seen_flush_at >= 15:
+            _seen_flush_at = now
+            threading.Thread(target=_flush_seen_bg, daemon=True).start()
     return pid
+
+def _flush_seen_bg():
+    try:
+        with lock:
+            flush_last_seen()
+    except Exception:
+        app.logger.exception("background last_seen flush failed")
 
 def device_id(persist_seen=False):
     with lock:

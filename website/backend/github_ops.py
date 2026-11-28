@@ -323,8 +323,8 @@ def parse_hadith_xlsx(raw: bytes) -> tuple[list[dict], list[str]]:
         title = str(title or "").strip()
         text = str(text or "").strip()
         source = str(source or "").strip()
-        if num < 1 or num > 500:
-            errors.append(err_prefix + "Number must be 1..500")
+        if num < 1:
+            errors.append(err_prefix + "Number must be >= 1")
         if num in seen:
             errors.append(err_prefix + f"duplicate Number {num}")
         seen.add(num)
@@ -332,23 +332,21 @@ def parse_hadith_xlsx(raw: bytes) -> tuple[list[dict], list[str]]:
             errors.append(err_prefix + "Title required")
         if not text:
             errors.append(err_prefix + "Text required")
-        if len(title) > 60:
-            errors.append(err_prefix + "Title max 60 characters")
-        if len(text) > 1500:
-            errors.append(err_prefix + "Text max 1500 characters")
-        if len(source) > 150:
-            errors.append(err_prefix + "Source max 150 characters")
+        if len(title) > 120:
+            errors.append(err_prefix + "Title max 120 characters")
+        if len(text) > 8000:
+            errors.append(err_prefix + "Text max 8000 characters")
+        if len(source) > 300:
+            errors.append(err_prefix + "Source max 300 characters")
         for label, val in (("Title", title), ("Text", text), ("Source", source)):
             if val and not ascii_english(val):
                 errors.append(err_prefix + f"{label} must be English ASCII")
         item = {"number": num, "title": title, "text": text, "source": source,
                 "hash": row_hash(str(num), title, text, source)}
-        raw_json = json.dumps(item, ensure_ascii=True).encode()
-        if len(raw_json) > 3000:
-            errors.append(err_prefix + "JSON would exceed 3000 bytes")
+        # Device doc buffer is 4 KB — keep each item JSON comfortably under that.
+        if len(json.dumps(item, ensure_ascii=True).encode()) > 3500:
+            errors.append(err_prefix + "JSON would exceed 3500 bytes (too long for the player)")
         rows.append(item)
-    if len(rows) > 500:
-        errors.append("Max 500 rows")
     rows.sort(key=lambda r: r["number"])
     return rows, errors
 
@@ -381,14 +379,14 @@ def parse_qa_xlsx(raw: bytes) -> tuple[list[dict], list[str]]:
             errors.append(err_prefix + "Question required")
         if not answer:
             errors.append(err_prefix + "Answer required")
-        if len(topic) > 60:
-            errors.append(err_prefix + "Topic max 60 characters")
-        if len(question) > 300:
-            errors.append(err_prefix + "Question max 300 characters")
-        if len(answer) > 1500:
-            errors.append(err_prefix + "Answer max 1500 characters")
-        if len(source) > 150:
-            errors.append(err_prefix + "Source max 150 characters")
+        if len(topic) > 120:
+            errors.append(err_prefix + "Topic max 120 characters")
+        if len(question) > 500:
+            errors.append(err_prefix + "Question max 500 characters")
+        if len(answer) > 8000:
+            errors.append(err_prefix + "Answer max 8000 characters")
+        if len(source) > 300:
+            errors.append(err_prefix + "Source max 300 characters")
         for label, val in (("Topic", topic), ("Question", question), ("Answer", answer), ("Source", source)):
             if val and not ascii_english(val):
                 errors.append(err_prefix + f"{label} must be English ASCII")
@@ -398,13 +396,10 @@ def parse_qa_xlsx(raw: bytes) -> tuple[list[dict], list[str]]:
             "topic": topic, "topic_id": tid, "question": question, "answer": answer,
             "source": source, "hash": row_hash(tid, question, answer, source),
         }
-        if len(json.dumps(item, ensure_ascii=True).encode()) > 3000:
-            errors.append(err_prefix + "JSON would exceed 3000 bytes")
+        # Device doc buffer is 4 KB — keep each item JSON comfortably under that.
+        if len(json.dumps(item, ensure_ascii=True).encode()) > 3500:
+            errors.append(err_prefix + "JSON would exceed 3500 bytes (too long for the player)")
         rows.append(item)
-    if len(topics) > 20:
-        errors.append("Max 20 Q&A topics")
-    if len(rows) > 500:
-        errors.append("Max 500 rows")
     return rows, errors
 
 

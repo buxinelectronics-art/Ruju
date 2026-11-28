@@ -126,6 +126,7 @@
       <button type="button" id="hadithPublish" disabled>Publish</button>
       <button type="button" id="hadithDelete">Delete live list</button>
       <p id="hadithProg" class="hint"></p>
+      <p class="hint">No row limit — large files save in batches; TTS may take several minutes.</p>
       <div id="hadithPreviewOut"></div>
     </div>
     <div class="box"><b>Live list</b><div id="hadithLive"></div></div>
@@ -139,6 +140,7 @@
       <button type="button" id="qaPublish" disabled>Publish</button>
       <button type="button" id="qaDelete">Delete live list</button>
       <p id="qaProg" class="hint"></p>
+      <p class="hint">No row/topic limit — large files save in batches; TTS may take several minutes.</p>
       <div id="qaPreviewOut"></div>
     </div>
     <div class="box"><b>Live list</b><div id="qaLive"></div></div>
@@ -433,7 +435,7 @@ async function checkDeviceOnline(pid, btn) {
   checkingPid = pid;
   const label = btn ? btn.textContent : "Connect";
   if (btn) { btn.disabled = true; btn.textContent = "Checking…"; }
-  const deadline = Date.now() + 45000;
+  const deadline = Date.now() + 90000;
   try {
     while (Date.now() < deadline) {
       await loadDevices();
