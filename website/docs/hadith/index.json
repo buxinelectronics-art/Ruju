@@ -1,1 +1,96 @@
-{"version": 0, "count": 0, "items": []}
+{
+  "version": 1,
+  "count": 10,
+  "items": [
+    {
+      "number": 1,
+      "title": "Intention",
+      "hash": "90d9370e7ad8e6bd",
+      "file": "001",
+      "provider": "github",
+      "key": "website/docs/hadith/001.mp3",
+      "url": "https://buxinelectronics-art.github.io/Ruju/hadith/001.mp3"
+    },
+    {
+      "number": 2,
+      "title": "Loving for Others",
+      "hash": "504c1d159765a01b",
+      "file": "002",
+      "provider": "github",
+      "key": "website/docs/hadith/002.mp3",
+      "url": "https://buxinelectronics-art.github.io/Ruju/hadith/002.mp3"
+    },
+    {
+      "number": 3,
+      "title": "Good Speech",
+      "hash": "d00d7515be740e5c",
+      "file": "003",
+      "provider": "github",
+      "key": "website/docs/hadith/003.mp3",
+      "url": "https://buxinelectronics-art.github.io/Ruju/hadith/003.mp3"
+    },
+    {
+      "number": 4,
+      "title": "Self-Control",
+      "hash": "0381471bb50a7b5f",
+      "file": "004",
+      "provider": "github",
+      "key": "website/docs/hadith/004.mp3",
+      "url": "https://buxinelectronics-art.github.io/Ruju/hadith/004.mp3"
+    },
+    {
+      "number": 5,
+      "title": "Safety from Harm",
+      "hash": "7a507d6b01b48e2a",
+      "file": "005",
+      "provider": "github",
+      "key": "website/docs/hadith/005.mp3",
+      "url": "https://buxinelectronics-art.github.io/Ruju/hadith/005.mp3"
+    },
+    {
+      "number": 6,
+      "title": "Sincerity",
+      "hash": "5b5440d92e2ada0a",
+      "file": "006",
+      "provider": "github",
+      "key": "website/docs/hadith/006.mp3",
+      "url": "https://buxinelectronics-art.github.io/Ruju/hadith/006.mp3"
+    },
+    {
+      "number": 7,
+      "title": "Ease",
+      "hash": "6d31b8617ccda31c",
+      "file": "007",
+      "provider": "github",
+      "key": "website/docs/hadith/007.mp3",
+      "url": "https://buxinelectronics-art.github.io/Ruju/hadith/007.mp3"
+    },
+    {
+      "number": 8,
+      "title": "Mercy",
+      "hash": "f61ac3c469f70f5c",
+      "file": "008",
+      "provider": "github",
+      "key": "website/docs/hadith/008.mp3",
+      "url": "https://buxinelectronics-art.github.io/Ruju/hadith/008.mp3"
+    },
+    {
+      "number": 9,
+      "title": "Seeking Knowledge",
+      "hash": "edaa698cc49ddb07",
+      "file": "009",
+      "provider": "github",
+      "key": "website/docs/hadith/009.mp3",
+      "url": "https://buxinelectronics-art.github.io/Ruju/hadith/009.mp3"
+    },
+    {
+      "number": 10,
+      "title": "The Quran",
+      "hash": "4d42bf0276ed63ca",
+      "file": "010",
+      "provider": "github",
+      "key": "website/docs/hadith/010.mp3",
+      "url": "https://buxinelectronics-art.github.io/Ruju/hadith/010.mp3"
+    }
+  ]
+}
