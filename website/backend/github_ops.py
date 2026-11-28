@@ -215,7 +215,8 @@ def atomic_update(changes: dict[str, bytes | str | None], message: str) -> str:
     if not new_commit.ok:
         raise RuntimeError(f"commit failed ({new_commit.status_code}): {new_commit.text[:240]}")
     sha = new_commit.json()["sha"]
-    upd = api("PATCH", f"git/ref/heads/{GITHUB_BRANCH}", json={"sha": sha, "force": False})
+    # Update uses plural "refs" (GET uses singular "ref").
+    upd = api("PATCH", f"git/refs/heads/{GITHUB_BRANCH}", json={"sha": sha, "force": False})
     if not upd.ok:
         raise RuntimeError(f"ref update failed ({upd.status_code}): {upd.text[:240]}")
     return sha
@@ -264,7 +265,7 @@ def atomic_replace(prefix: str, files: dict[str, bytes], message: str) -> str:
         raise RuntimeError(f"commit failed ({new_commit.status_code}): {new_commit.text[:240]}")
     sha = new_commit.json()["sha"]
 
-    upd = api("PATCH", f"git/ref/heads/{GITHUB_BRANCH}", json={"sha": sha, "force": False})
+    upd = api("PATCH", f"git/refs/heads/{GITHUB_BRANCH}", json={"sha": sha, "force": False})
     if not upd.ok:
         raise RuntimeError(f"ref update failed ({upd.status_code}): {upd.text[:240]}")
     return sha
