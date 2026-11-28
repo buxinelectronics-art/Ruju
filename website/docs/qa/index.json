@@ -14,7 +14,12 @@
     {
       "id": "prophet-muhammad",
       "name": "Prophet Muhammad",
-      "count": 10
+      "count": 12
+    },
+    {
+      "id": "prayer",
+      "name": "Prayer",
+      "count": 8
     }
   ]
 }
