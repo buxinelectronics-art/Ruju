@@ -45,6 +45,16 @@
       "id": "character",
       "name": "Character",
       "count": 10
+    },
+    {
+      "id": "prophets",
+      "name": "Prophets",
+      "count": 8
+    },
+    {
+      "id": "hereafter",
+      "name": "Hereafter",
+      "count": 2
     }
   ]
 }
