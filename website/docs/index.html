@@ -66,9 +66,18 @@
 
   <section id="tab-huruf" hidden>
     <div class="box">
-      <b>Batch assign</b>
+      <b>Bulk paste audio links</b>
+      <p class="hint">One letter per line: <code>01 https://…/alif.mp3</code>. HTTPS direct MP3 only. Preview, then save to media.json.</p>
+      <textarea id="hurufLinksText" rows="8" placeholder="01 https://example.com/alif.mp3&#10;02 https://example.com/ba.mp3"></textarea>
+      <button type="button" id="hurufLinksPreview">Preview</button>
+      <button type="button" id="hurufLinksSave" disabled>Save links</button>
+      <p id="hurufLinksProg" class="hint"></p>
+      <div id="hurufLinksPreviewOut"></div>
+    </div>
+    <div class="box">
+      <b>Batch assign files</b>
       <input id="hurufBatch" type="file" accept="audio/mpeg,.mp3" multiple>
-      <p class="hint">Select up to 28 MP3s, then assign each to a letter below.</p>
+      <p class="hint">Select up to 28 MP3s, then assign each to a letter below. Upload still works.</p>
       <div id="hurufBatchList"></div>
     </div>
     <div id="hurufSlots"></div>
@@ -173,6 +182,7 @@ let password = "";
 let meta = { methods: [], asr_options: [], high_lat: [] };
 let hadithRows = null, qaRows = null;
 let hurufBatchFiles = [];
+let hurufLinkRows = null;
 let songsCache = [];
 let songsPending = []; // {file, link, title, artist, status, error, client_id}
 let storageInfo = { default: "github", providers: [] };
@@ -369,41 +379,50 @@ async function loadHuruf() {
   d.slots.forEach(slot => {
     const box = el("div", { class: "box" });
     box.appendChild(el("b", { text: `${String(slot.n).padStart(2, "0")} — ${slot.name}` }));
-    box.appendChild(el("p", { class: "hint", text: slot.present ? `Uploaded (${slot.size} bytes)` : "Not uploaded" }));
+    box.appendChild(el("p", { class: "hint", text: slot.present
+      ? `${slot.source || "link"} · ${fmtBytes(slot.size)}`
+      : "Not set (device will use huruf/" + String(slot.n).padStart(2, "0") + ".mp3)" }));
     if (slot.url) {
       const a = el("audio", { controls: "controls", preload: "none" });
       a.src = slot.url;
       box.appendChild(a);
     }
-    box.appendChild(el("p", { class: "hint", text: slot.source ? ("Source: " + slot.source) : "Source: (default path)" }));
     const prov = providerSelect();
-    const link = el("input", { type: "url", maxlength: "250", placeholder: "Or paste https://…mp3 link" });
+    const link = el("input", {
+      type: "url", maxlength: "250",
+      placeholder: "Paste audio link (https://…mp3)"
+    });
+    if (slot.source === "link" && slot.url) link.value = slot.url;
     const input = el("input", { type: "file", accept: "audio/mpeg,.mp3" });
-    const btn = el("button", { type: "button", text: "Upload / replace" });
+    const btn = el("button", { type: "button", text: "Save link / upload" });
     btn.onclick = () => run(async () => {
       const fd = new FormData();
       fd.append("n", String(slot.n));
       fd.append("provider", prov.value);
       if (link.value.trim()) fd.append("link", link.value.trim());
       else if (input.files[0]) fd.append("file", input.files[0], input.files[0].name);
-      else throw new Error("Choose an MP3 or paste a link");
+      else throw new Error("Paste an audio link or choose an MP3");
       await upload("/content/huruf", fd);
-      setMsg(`Huruf ${slot.n} updated.`, true);
+      setMsg(`Huruf ${String(slot.n).padStart(2, "0")} updated.`, true);
       await loadHuruf();
     });
-    box.append(labeled("Storage", prov), labeled("Paste link", link));
+    box.append(
+      labeled("Storage (for file upload)", prov),
+      labeled("Paste audio link", link),
+      labeled("Or upload MP3", input),
+      btn
+    );
     if (hurufBatchFiles.length) {
       const assign = el("select");
       assign.appendChild(el("option", { value: "", text: "Assign batch file…" }));
       hurufBatchFiles.forEach((f, i) => assign.appendChild(el("option", { value: String(i), text: f.name })));
       assign.onchange = () => {
         if (assign.value === "") return;
-        input.files = null;
-        // cannot set input.files; upload directly from batch
         const file = hurufBatchFiles[Number(assign.value)];
         run(async () => {
           const fd = new FormData();
           fd.append("n", String(slot.n));
+          fd.append("provider", prov.value);
           fd.append("file", file, file.name);
           await upload("/content/huruf", fd);
           setMsg(`Huruf ${slot.n} ← ${file.name}`, true);
@@ -412,7 +431,6 @@ async function loadHuruf() {
       };
       box.appendChild(assign);
     }
-    box.append(input, btn);
     root.appendChild(box);
   });
 }
@@ -424,6 +442,45 @@ $("hurufBatch").onchange = () => {
   hurufBatchFiles.forEach(f => wrap.appendChild(el("p", { class: "hint", text: f.name })));
   loadHuruf();
 };
+
+$("hurufLinksPreview").onclick = () => run(async () => {
+  const text = $("hurufLinksText").value;
+  const d = await call("/content/huruf/links/preview", "POST", { text });
+  const out = $("hurufLinksPreviewOut");
+  out.replaceChildren();
+  if (d.errors && d.errors.length) {
+    d.errors.forEach(e => out.appendChild(el("p", { class: "err", text: e })));
+    hurufLinkRows = null;
+    $("hurufLinksSave").disabled = true;
+    $("hurufLinksProg").textContent = "";
+  } else {
+    out.appendChild(el("p", { class: "ok", text: `OK — ${d.count} letter links` }));
+    out.appendChild(previewTable(d.rows, ["id", "name", "url"]));
+    // audio previews
+    d.rows.forEach(r => {
+      const row = el("div", { class: "hint" });
+      row.appendChild(document.createTextNode(`${r.id} ${r.name}: `));
+      const a = el("audio", { controls: "controls", preload: "none" });
+      a.src = r.url;
+      row.appendChild(a);
+      out.appendChild(row);
+    });
+    hurufLinkRows = d.rows;
+    $("hurufLinksSave").disabled = false;
+    $("hurufLinksProg").textContent = "Preview OK. Click Save links to write media.json.";
+  }
+});
+
+$("hurufLinksSave").onclick = () => run(async () => {
+  if (!hurufLinkRows || !hurufLinkRows.length) throw new Error("Preview the links first");
+  $("hurufLinksProg").textContent = "Verifying MP3s and saving…";
+  const d = await call("/content/huruf/links", "POST", { rows: hurufLinkRows });
+  $("hurufLinksProg").textContent = `Saved ${d.count} links (media v${d.media_version}).`;
+  setMsg("Huruf links saved to media.json.", true);
+  $("hurufLinksSave").disabled = true;
+  hurufLinkRows = null;
+  await loadHuruf();
+});
 
 function previewTable(rows, cols) {
   const table = el("table");

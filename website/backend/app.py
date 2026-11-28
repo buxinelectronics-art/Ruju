@@ -617,6 +617,67 @@ def huruf_upload():
     return jsonify(ok=True, n=n, name=gh.HURUF_NAMES[n - 1], source=stored.meta(),
                    media_version=media.get("version"))
 
+@app.post("/api/admin/content/huruf/links/preview")
+def huruf_links_preview():
+    """Parse bulk letter links without downloading (preview only)."""
+    if (e := need_github()):
+        return e
+    text = str(body().get("text") or "")
+    rows, errors = storage.parse_huruf_link_lines(text)
+    return jsonify(ok=not errors, rows=rows, errors=errors, count=len(rows))
+
+@app.post("/api/admin/content/huruf/links")
+def huruf_links_save():
+    """Verify each HTTPS MP3, then write all links into docs/media.json in one commit."""
+    if (e := need_github()):
+        return e
+    d = body()
+    text = str(d.get("text") or "")
+    rows = d.get("rows")
+    if isinstance(rows, list) and rows:
+        from storage.link_fetch import assert_safe_url
+        parsed = []
+        errors = []
+        for r in rows:
+            try:
+                n = int(r.get("n"))
+                url = str(r.get("url") or "").strip()
+                if n < 1 or n > 28:
+                    errors.append(f"Bad letter number {n}")
+                    continue
+                assert_safe_url(url)
+                parsed.append({"n": n, "id": f"{n:02d}", "name": gh.HURUF_NAMES[n - 1], "url": url})
+            except Exception as ex:
+                errors.append(str(ex))
+        if errors:
+            return error("; ".join(errors[:5]), 400)
+        rows = parsed
+    else:
+        rows, errors = storage.parse_huruf_link_lines(text)
+        if errors:
+            return jsonify(ok=False, errors=errors), 400
+    if not rows:
+        return error("No links to save", 400)
+    try:
+        old = storage.load_media()
+        huruf = dict(old.get("huruf") or {})
+        verified = []
+        for r in rows:
+            stored = storage.register_link(r["url"], max_kbps=None)
+            entry = storage.entry_from_stored(stored)
+            huruf[r["id"]] = entry
+            verified.append({"n": r["n"], "id": r["id"], "name": r["name"], "url": stored.url, "size": stored.size})
+        media = dict(old)
+        media["huruf"] = huruf
+        # Publish list only after all links verified.
+        sha = storage.save_media(media, f"Set Huruf audio links ({len(verified)} letters)")
+    except StorageError as ex:
+        return error(str(ex), 400)
+    except Exception as ex:
+        return error(str(ex), 502)
+    return jsonify(ok=True, commit=sha, count=len(verified), rows=verified,
+                   media_version=media.get("version"))
+
 def _job_new(kind):
     jid = secrets.token_hex(8)
     with publish_lock:

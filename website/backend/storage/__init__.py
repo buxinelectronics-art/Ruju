@@ -147,3 +147,40 @@ def object_key_for(kind: str, name: str) -> str:
     if not _SAFE_KEY.match(key):
         raise StorageError("Bad storage object key")
     return key
+
+
+def parse_huruf_link_lines(text: str) -> tuple[list[dict[str, Any]], list[str]]:
+    """Parse lines like '01 https://…/alif.mp3'. Preview only — does not download."""
+    rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    seen: set[str] = set()
+    if not (text or "").strip():
+        return [], ["Paste at least one line: NN https://…mp3"]
+    for i, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"^(\d{1,2})\s+(https://\S+)$", line, re.I)
+        if not m:
+            errors.append(f"Line {i}: use format NN https://…mp3 (got: {line[:60]})")
+            continue
+        n = int(m.group(1))
+        url = m.group(2).strip()
+        if n < 1 or n > 28:
+            errors.append(f"Line {i}: letter number must be 01..28")
+            continue
+        stem = f"{n:02d}"
+        if stem in seen:
+            errors.append(f"Line {i}: duplicate letter {stem}")
+            continue
+        seen.add(stem)
+        try:
+            assert_safe_url(url)
+        except StorageError as ex:
+            errors.append(f"Line {i} ({stem}): {ex}")
+            continue
+        name = gh.HURUF_NAMES[n - 1]
+        rows.append({"n": n, "id": stem, "name": name, "url": url})
+    if not rows and not errors:
+        errors.append("No valid letter links found")
+    return rows, errors
