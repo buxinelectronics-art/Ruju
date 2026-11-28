@@ -40,6 +40,11 @@
       "id": "hajj",
       "name": "Hajj",
       "count": 8
+    },
+    {
+      "id": "character",
+      "name": "Character",
+      "count": 10
     }
   ]
 }
