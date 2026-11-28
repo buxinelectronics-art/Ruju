@@ -31,6 +31,7 @@ SETTINGS = {
     "stt_model": "gpt-4o-mini-transcribe",
     "tts_model": "gpt-4o-mini-tts",
     "voice": "alloy",
+    "audio_provider": "github",  # github | cloudinary | s3 — new uploads only
     "instructions": "You are Deen AI, a religious question assistant. Focus on Islam; you may also answer "
     "questions about Christianity and religion. If a question is not about religion, reply exactly: "
     "I can only answer religious questions. A greeting may get a short greeting. Answer in simple English, "
@@ -409,6 +410,8 @@ def test_speak():
 
 # ---------- GitHub Pages content (docs/ only) ----------
 import github_ops as gh
+import storage
+from storage.base import StorageError
 
 publish_jobs = {}
 publish_lock = threading.Lock()
@@ -418,23 +421,93 @@ def need_github():
         return error("Set GITHUB_TOKEN, GITHUB_REPO and GITHUB_BRANCH on Render", 503)
     return None
 
+def _audio_provider(form_or_body=None):
+    raw = ""
+    if form_or_body is not None:
+        if hasattr(form_or_body, "get"):
+            raw = form_or_body.get("provider") or form_or_body.get("audio_provider") or ""
+        elif isinstance(form_or_body, dict):
+            raw = form_or_body.get("provider") or form_or_body.get("audio_provider") or ""
+    try:
+        return storage.resolve_provider(str(raw), data.get("settings"))
+    except StorageError as ex:
+        raise ValueError(str(ex)) from ex
+
+def _ingest_audio(*, file_storage=None, link: str = "", provider: str,
+                  docs_rel: str, object_key: str,
+                  max_bytes: int = 5 * 1024 * 1024, max_kbps: int | None = None):
+    """Upload a file to a provider, or validate a pasted HTTPS MP3 link."""
+    link = (link or "").strip()
+    if link:
+        return storage.register_link(link, max_kbps=max_kbps)
+    if not file_storage:
+        raise StorageError("Choose an MP3 file or paste an HTTPS audio link")
+    raw = file_storage.read()
+    return storage.upload_bytes(
+        raw, provider=provider, docs_rel=docs_rel, object_key=object_key,
+        max_bytes=max_bytes, max_kbps=max_kbps,
+    )
+
+@app.get("/api/admin/storage")
+def storage_status():
+    from storage.base import PROVIDERS
+    return jsonify(
+        default=storage.default_provider(data.get("settings")),
+        providers=storage.providers_status(),
+        options=list(PROVIDERS),
+    )
+
+@app.post("/api/admin/storage")
+def storage_set_default():
+    from storage.base import PROVIDERS
+    provider = str(body().get("audio_provider") or body().get("provider") or "").strip().lower()
+    if provider not in PROVIDERS:
+        return error("audio_provider must be github, cloudinary, or s3", 400)
+    with lock:
+        data["settings"]["audio_provider"] = provider
+        save()
+    return jsonify(ok=True, default=provider)
+
+@app.post("/api/admin/storage/test")
+def storage_test():
+    provider = str(body().get("provider") or "").strip().lower()
+    try:
+        result = storage.test_provider(provider)
+    except StorageError as ex:
+        return error(str(ex), 400)
+    except Exception as ex:
+        return error(str(ex), 502)
+    return jsonify(result)
+
 @app.get("/api/admin/content/adhan")
 def adhan_status():
     if (e := need_github()):
         return e
+    try:
+        media = storage.load_media()
+    except Exception as ex:
+        return error(str(ex), 502)
     out = {}
-    for name in ("adhan.mp3", "fajr.mp3"):
+    for kind, name in (("adhan", "adhan.mp3"), ("fajr", "fajr.mp3")):
         path = "website/docs/adhan/" + name
         try:
             info = gh.get_file(path)
         except Exception as ex:
             return error(str(ex), 502)
-        out[name] = None if not info else {
-            "path": path, "size": info.get("size", 0),
-            "sha": (info.get("sha") or "")[:12],
-            "url": info.get("download_url") or info.get("html_url"),
+        entry = (media.get("adhan") or {}).get(kind) or {}
+        play = storage.public_play_url(entry, f"adhan/{name}", int(media.get("version") or 0))
+        out[name] = {
+            "path": path,
+            "present": bool(info) or bool(entry.get("url")),
+            "size": entry.get("size") or (info or {}).get("size", 0),
+            "sha": ((info or {}).get("sha") or "")[:12],
+            "url": play,
+            "source": entry.get("provider") or ("github" if info else ""),
+            "key": entry.get("key") or "",
+            "github_file": bool(info),
         }
-    return jsonify(files=out, repo=GITHUB_REPO, branch=GITHUB_BRANCH)
+    return jsonify(files=out, media_version=media.get("version", 0),
+                   default_provider=storage.default_provider(data.get("settings")))
 
 @app.post("/api/admin/content/adhan")
 def adhan_upload():
@@ -443,42 +516,65 @@ def adhan_upload():
     kind = str(request.form.get("kind", "")).strip().lower()
     if kind not in ("adhan", "fajr"):
         return error("kind must be adhan or fajr", 400)
-    f = request.files.get("file")
-    if not f:
-        return error("Choose an MP3 file", 400)
-    raw = f.read()
-    if len(raw) < 1000:
-        return error("File is too small", 400)
-    if len(raw) > 5 * 1024 * 1024:
-        return error("File is too large (max 5 MB)", 400)
-    if not gh.looks_like_mp3(raw):
-        return error("File does not look like an MP3", 400)
-    path = "website/docs/adhan/" + kind + ".mp3"
     try:
-        gh.put_file(path, raw, f"Update {path}")
+        provider = _audio_provider(request.form)
+        old = storage.load_media()
+        old_entry = (old.get("adhan") or {}).get(kind)
+        stored = _ingest_audio(
+            file_storage=request.files.get("file"),
+            link=str(request.form.get("link", "")),
+            provider=provider,
+            docs_rel=f"adhan/{kind}.mp3",
+            object_key=storage.object_key_for("adhan", f"{kind}.mp3"),
+            max_bytes=5 * 1024 * 1024,
+            max_kbps=None,
+        )
+        media = dict(old)
+        adhan = dict(media.get("adhan") or {})
+        adhan[kind] = storage.entry_from_stored(stored)
+        media["adhan"] = adhan
+        storage.save_media(media, f"Update adhan/{kind} audio source")
+    except (StorageError, ValueError) as ex:
+        return error(str(ex), 400)
     except Exception as ex:
         return error(str(ex), 502)
-    return jsonify(ok=True, path=path, size=len(raw))
+    if old_entry and (old_entry.get("key") != stored.key or old_entry.get("provider") != stored.provider):
+        try:
+            storage.delete_stored(old_entry)
+        except Exception:
+            app.logger.exception("adhan old delete failed")
+    return jsonify(ok=True, kind=kind, source=stored.meta(), media_version=media.get("version"))
 
 @app.get("/api/admin/content/huruf")
 def huruf_status():
     if (e := need_github()):
         return e
+    try:
+        media = storage.load_media()
+    except Exception as ex:
+        return error(str(ex), 502)
+    huruf_map = media.get("huruf") or {}
     slots = []
     for i, name in enumerate(gh.HURUF_NAMES, start=1):
-        path = f"website/docs/huruf/{i:02d}.mp3"
+        stem = f"{i:02d}"
+        path = f"website/docs/huruf/{stem}.mp3"
         try:
             info = gh.get_file(path)
         except Exception as ex:
             return error(str(ex), 502)
+        entry = huruf_map.get(stem) or {}
+        play = storage.public_play_url(entry, f"huruf/{stem}.mp3", int(media.get("version") or 0))
         slots.append({
             "n": i, "name": name, "path": path,
-            "present": bool(info),
-            "size": (info or {}).get("size", 0),
+            "present": bool(info) or bool(entry.get("url")),
+            "size": entry.get("size") or (info or {}).get("size", 0),
             "sha": ((info or {}).get("sha") or "")[:12],
-            "url": (info or {}).get("download_url"),
+            "url": play,
+            "source": entry.get("provider") or ("github" if info else ""),
+            "key": entry.get("key") or "",
         })
-    return jsonify(slots=slots)
+    return jsonify(slots=slots, media_version=media.get("version", 0),
+                   default_provider=storage.default_provider(data.get("settings")))
 
 @app.post("/api/admin/content/huruf")
 def huruf_upload():
@@ -490,20 +586,36 @@ def huruf_upload():
         return error("n must be 1..28", 400)
     if n < 1 or n > 28:
         return error("n must be 1..28", 400)
-    f = request.files.get("file")
-    if not f:
-        return error("Choose an MP3 file", 400)
-    raw = f.read()
-    if len(raw) < 500 or len(raw) > 5 * 1024 * 1024:
-        return error("Bad file size", 400)
-    if not gh.looks_like_mp3(raw):
-        return error("File does not look like an MP3", 400)
-    path = f"website/docs/huruf/{n:02d}.mp3"
+    stem = f"{n:02d}"
     try:
-        gh.put_file(path, raw, f"Update {path}")
+        provider = _audio_provider(request.form)
+        old = storage.load_media()
+        old_entry = (old.get("huruf") or {}).get(stem)
+        stored = _ingest_audio(
+            file_storage=request.files.get("file"),
+            link=str(request.form.get("link", "")),
+            provider=provider,
+            docs_rel=f"huruf/{stem}.mp3",
+            object_key=storage.object_key_for("huruf", f"{stem}.mp3"),
+            max_bytes=5 * 1024 * 1024,
+            max_kbps=None,
+        )
+        media = dict(old)
+        huruf = dict(media.get("huruf") or {})
+        huruf[stem] = storage.entry_from_stored(stored)
+        media["huruf"] = huruf
+        storage.save_media(media, f"Update huruf/{stem} audio source")
+    except (StorageError, ValueError) as ex:
+        return error(str(ex), 400)
     except Exception as ex:
         return error(str(ex), 502)
-    return jsonify(ok=True, path=path, size=len(raw), name=gh.HURUF_NAMES[n - 1])
+    if old_entry and (old_entry.get("key") != stored.key or old_entry.get("provider") != stored.provider):
+        try:
+            storage.delete_stored(old_entry)
+        except Exception:
+            app.logger.exception("huruf old delete failed")
+    return jsonify(ok=True, n=n, name=gh.HURUF_NAMES[n - 1], source=stored.meta(),
+                   media_version=media.get("version"))
 
 def _job_new(kind):
     jid = secrets.token_hex(8)
@@ -553,46 +665,81 @@ def _publish_hadith(jid, rows):
         _job_set(jid, progress="loading live index", total=len(rows))
         old = gh.load_hadith_index()
         old_map = {int(it.get("number")): it for it in old.get("items", []) if "number" in it}
+        provider = storage.default_provider(data.get("settings"))
         files = {}
         version = int(old.get("version") or 0) + 1
         items_meta = []
+        old_audio = []
         for i, row in enumerate(rows):
             num = int(row["number"])
             stem = f"{num:03d}"
             json_obj = {"number": num, "title": row["title"], "text": row["text"], "source": row["source"]}
-            json_bytes = json.dumps(json_obj, ensure_ascii=True, separators=(",", ":")).encode()
             prev = old_map.get(num)
             reuse = prev and prev.get("hash") == row["hash"]
             mp3_path = f"website/docs/hadith/{stem}.mp3"
-            if reuse:
-                existing = gh.get_file_bytes(mp3_path)
-                if not existing:
-                    reuse = False
-            if reuse:
-                mp3 = existing
+            audio_meta = {}
+            if reuse and prev.get("url") and prev.get("provider") == provider:
+                json_obj["url"] = prev["url"]
+                audio_meta = {"provider": prev.get("provider"), "key": prev.get("key") or "", "url": prev["url"]}
+                if provider == "github":
+                    existing = gh.get_file_bytes(mp3_path)
+                    if existing:
+                        files[mp3_path] = existing
                 _job_set(jid, progress=f"reuse {i + 1}/{len(rows)}", done=i + 1)
             else:
-                _job_set(jid, progress=f"TTS {i + 1}/{len(rows)}", done=i)
-                speak = row["title"] + ". " + row["text"]
-                if row.get("source"):
-                    speak += ". Source: " + row["source"]
-                for attempt in range(3):
-                    try:
-                        mp3 = tts(speak[:4000])
-                        break
-                    except Exception as ex:
-                        if attempt == 2:
-                            raise
-                        time.sleep(1 + attempt)
-                        _job_set(jid, progress=f"TTS retry {i + 1}/{len(rows)}")
-                _job_set(jid, progress=f"TTS done {i + 1}/{len(rows)}", done=i + 1)
+                if reuse and provider == "github":
+                    existing = gh.get_file_bytes(mp3_path)
+                    if existing:
+                        files[mp3_path] = existing
+                        _job_set(jid, progress=f"reuse {i + 1}/{len(rows)}", done=i + 1)
+                        reuse = True
+                    else:
+                        reuse = False
+                if not reuse or (reuse and provider != "github" and not json_obj.get("url")):
+                    reuse = False
+                if not reuse:
+                    _job_set(jid, progress=f"TTS {i + 1}/{len(rows)}", done=i)
+                    speak = row["title"] + ". " + row["text"]
+                    if row.get("source"):
+                        speak += ". Source: " + row["source"]
+                    for attempt in range(3):
+                        try:
+                            mp3 = tts(speak[:4000])
+                            break
+                        except Exception:
+                            if attempt == 2:
+                                raise
+                            time.sleep(1 + attempt)
+                            _job_set(jid, progress=f"TTS retry {i + 1}/{len(rows)}")
+                    stored = storage.upload_bytes(
+                        mp3, provider=provider, docs_rel=f"hadith/{stem}.mp3",
+                        object_key=storage.object_key_for("hadith", f"{stem}.mp3"),
+                        max_bytes=5 * 1024 * 1024, max_kbps=None,
+                    )
+                    json_obj["url"] = stored.url
+                    audio_meta = stored.meta()
+                    if provider == "github":
+                        # put_file already wrote; keep blob in tree via get
+                        existing = gh.get_file_bytes(mp3_path)
+                        if existing:
+                            files[mp3_path] = existing
+                    if prev:
+                        old_audio.append(prev)
+                    _job_set(jid, progress=f"TTS done {i + 1}/{len(rows)}", done=i + 1)
+            json_bytes = json.dumps(json_obj, ensure_ascii=True, separators=(",", ":")).encode()
             files[f"website/docs/hadith/{stem}.json"] = json_bytes
-            files[mp3_path] = mp3
-            items_meta.append({"number": num, "title": row["title"], "hash": row["hash"], "file": stem})
+            meta = {"number": num, "title": row["title"], "hash": row["hash"], "file": stem}
+            meta.update({k: audio_meta[k] for k in ("provider", "key", "url") if audio_meta.get(k)})
+            items_meta.append(meta)
         index = {"version": version, "count": len(items_meta), "items": items_meta}
         files["website/docs/hadith/index.json"] = json.dumps(index, ensure_ascii=True, indent=2).encode()
         _job_set(jid, progress="committing to GitHub")
         sha = gh.atomic_replace("website/docs/hadith/", files, f"Publish hadith v{version} ({len(rows)} items)")
+        for old_meta in old_audio:
+            try:
+                storage.delete_stored(old_meta)
+            except Exception:
+                app.logger.exception("hadith old audio delete failed")
         _job_set(jid, status="done", ok=True, progress="done", done=len(rows), commit=sha, version=version)
     except Exception as ex:
         app.logger.exception("hadith publish failed")
@@ -780,12 +927,16 @@ def songs_list():
                         if path.startswith(gh.SONGS_PREFIX) and path.endswith(".mp3"):
                             sizes[path.rsplit("/", 1)[-1].removesuffix(".mp3")] = int(item.get("size") or 0)
         for s in songs:
-            s["size"] = sizes.get(s["id"], 0)
-            s["url"] = f"{DEFAULT_CONTENT_URL}/songs/{s['id']}.mp3?v={idx.get('version') or 0}"
+            if not s.get("size"):
+                s["size"] = sizes.get(s["id"], 0)
+            if not s.get("url"):
+                s["url"] = f"{DEFAULT_CONTENT_URL}/songs/{s['id']}.mp3?v={idx.get('version') or 0}"
+            s["source"] = s.get("provider") or "github"
     except Exception as ex:
         return error(str(ex), 502)
     return jsonify(index=idx, songs=songs, storage=_songs_storage_payload(stats),
-                   max_mb=10, max_kbps=gh.SONG_MP3_MAX_KBPS)
+                   max_mb=10, max_kbps=gh.SONG_MP3_MAX_KBPS,
+                   default_provider=storage.default_provider(data.get("settings")))
 
 @app.post("/api/admin/songs/batch/start")
 def songs_batch_start():
@@ -795,7 +946,11 @@ def songs_batch_start():
         stats = gh.website_docs_stats()
     except Exception as ex:
         return error(str(ex), 502)
-    if stats["docs_bytes"] >= gh.DOCS_BLOCK_BYTES:
+    try:
+        provider = _audio_provider(body() if request.is_json else request.form)
+    except ValueError as ex:
+        return error(str(ex), 400)
+    if provider == "github" and stats["docs_bytes"] >= gh.DOCS_BLOCK_BYTES:
         return error(
             f"Storage full: website/docs is over {gh.DOCS_BLOCK_BYTES // (1024 * 1024)} MB. "
             "Delete songs or other content before uploading.",
@@ -804,17 +959,18 @@ def songs_batch_start():
     bid = secrets.token_hex(8)
     with publish_lock:
         song_batches[bid] = {
-            "items": [], "status": "open", "created": time.time(),
+            "items": [], "status": "open", "created": time.time(), "provider": provider,
             "error": "", "warning": (
                 f"Warning: website/docs is over {gh.DOCS_WARN_BYTES // (1024 * 1024)} MB"
                 if stats["docs_bytes"] >= gh.DOCS_WARN_BYTES else ""
             ),
         }
-    return jsonify(batch_id=bid, storage=_songs_storage_payload(stats), warning=song_batches[bid]["warning"])
+    return jsonify(batch_id=bid, provider=provider, storage=_songs_storage_payload(stats),
+                   warning=song_batches[bid]["warning"])
 
 @app.post("/api/admin/songs/batch/<bid>/file")
 def songs_batch_file(bid):
-    """Validate one MP3, strip ID3, create a Git blob (no branch change yet)."""
+    """Validate one MP3 or paste-link; stage for one Git commit of the song list."""
     if (e := need_github()):
         return e
     with publish_lock:
@@ -827,38 +983,67 @@ def songs_batch_file(bid):
         return error(err, 400)
     if (err := gh.song_artist_ok(artist)):
         return error(err, 400)
-    f = request.files.get("file")
-    if not f:
-        return error("Choose an MP3 file", 400)
-    raw = f.read()
-    cleaned, errors = gh.validate_song_mp3(raw)
-    if errors:
-        return error(errors[0], 400)
+    provider = batch.get("provider") or storage.default_provider(data.get("settings"))
+    link = str(request.form.get("link", "")).strip()
     try:
-        stats = gh.website_docs_stats()
-        pending = sum(it["size"] for it in batch["items"]) + len(cleaned)
-        if stats["docs_bytes"] + pending > gh.DOCS_BLOCK_BYTES:
-            return error(
-                f"Upload blocked: this file would push website/docs over "
-                f"{gh.DOCS_BLOCK_BYTES // (1024 * 1024)} MB",
-                400,
+        if link:
+            stored = storage.register_link(link, max_kbps=gh.SONG_MP3_MAX_KBPS)
+            item = {
+                "client_id": str(request.form.get("client_id", ""))[:40],
+                "title": title, "artist": artist,
+                "provider": stored.provider, "url": stored.url, "key": "",
+                "size": stored.size, "sha": "",
+            }
+        elif provider == "github":
+            f = request.files.get("file")
+            if not f:
+                raise StorageError("Choose an MP3 file or paste an HTTPS audio link")
+            cleaned, errors = gh.validate_song_mp3(f.read())
+            if errors:
+                raise StorageError(errors[0])
+            stats = gh.website_docs_stats()
+            pending = sum(it.get("size", 0) for it in batch["items"]) + len(cleaned)
+            if stats["docs_bytes"] + pending > gh.DOCS_BLOCK_BYTES:
+                raise StorageError(
+                    f"Upload blocked: this file would push website/docs over "
+                    f"{gh.DOCS_BLOCK_BYTES // (1024 * 1024)} MB"
+                )
+            blob_sha = gh.create_blob(cleaned)
+            item = {
+                "client_id": str(request.form.get("client_id", ""))[:40],
+                "title": title, "artist": artist,
+                "provider": "github", "url": "", "key": "",
+                "size": len(cleaned), "sha": blob_sha,
+            }
+        else:
+            stored = _ingest_audio(
+                file_storage=request.files.get("file"),
+                link="",
+                provider=provider,
+                docs_rel="songs/_unused.mp3",
+                object_key=storage.object_key_for("songs", f"pending-{secrets.token_hex(4)}.mp3"),
+                max_bytes=gh.SONG_MP3_MAX_BYTES,
+                max_kbps=gh.SONG_MP3_MAX_KBPS,
             )
-        blob_sha = gh.create_blob(cleaned)
+            item = {
+                "client_id": str(request.form.get("client_id", ""))[:40],
+                "title": title, "artist": artist,
+                "provider": stored.provider, "url": stored.url, "key": stored.key,
+                "size": stored.size, "sha": "",
+            }
+    except (StorageError, ValueError) as ex:
+        return error(str(ex), 400)
     except Exception as ex:
         return error(str(ex), 502)
-    item = {
-        "client_id": str(request.form.get("client_id", ""))[:40],
-        "title": title, "artist": artist, "sha": blob_sha, "size": len(cleaned),
-    }
     with publish_lock:
         batch = song_batches.get(bid)
         if not batch or batch.get("status") != "open":
             return error("Batch closed", 404)
         batch["items"].append(item)
         n = len(batch["items"])
-    return jsonify(ok=True, index=n - 1, size=len(cleaned), sha=blob_sha[:12],
-                   warning=("Warning: approaching storage limit"
-                            if stats["docs_bytes"] + pending >= gh.DOCS_WARN_BYTES else ""))
+    return jsonify(ok=True, index=n - 1, size=item["size"],
+                   source={"provider": item["provider"], "url": item.get("url") or "", "key": item.get("key") or ""},
+                   warning="")
 
 @app.post("/api/admin/songs/batch/<bid>/commit")
 def songs_batch_commit(bid):
@@ -880,18 +1065,37 @@ def songs_batch_commit(bid):
         old_count = len(songs)
         nid = gh.next_song_id(songs)
         added = []
-        changes: dict = {}
+        changes = {}
+        store_items = [it for it in (idx.get("items") or []) if isinstance(it, dict)]
         for it in items:
             sid = f"s{nid:04d}"
             nid += 1
-            songs.append({"id": sid, "title": it["title"], "artist": it.get("artist") or ""})
-            changes[f"{gh.SONGS_PREFIX}{sid}.mp3"] = it["sha"]
+            song = {"id": sid, "title": it["title"], "artist": it.get("artist") or ""}
+            if it.get("url"):
+                song["url"] = it["url"]
+            elif it.get("sha"):
+                song["url"] = f"{DEFAULT_CONTENT_URL}/songs/{sid}.mp3"
+            if it.get("provider"):
+                song["provider"] = it["provider"]
+            if it.get("key"):
+                song["key"] = it["key"]
+            if it.get("sha"):
+                changes[f"{gh.SONGS_PREFIX}{sid}.mp3"] = it["sha"]
+                song["key"] = f"{gh.SONGS_PREFIX}{sid}.mp3"
+            songs.append(song)
+            store_items.append({
+                "id": sid, "provider": song.get("provider") or "github",
+                "key": song.get("key") or "", "size": it.get("size") or 0,
+            })
             added.append(sid)
         version = int(idx.get("version") or 0) + 1
         pages = gh.build_song_pages(songs)
         changes.update(pages)
         changes.update(gh.songs_page_deletes(old_count, len(songs)))
-        index = {"version": version, "count": len(songs), "pageSize": gh.SONGS_PAGE_SIZE}
+        index = {
+            "version": version, "count": len(songs), "pageSize": gh.SONGS_PAGE_SIZE,
+            "items": store_items,
+        }
         changes[gh.SONGS_PREFIX + "index.json"] = json.dumps(index, ensure_ascii=True, separators=(",", ":")).encode()
         sha = gh.atomic_update(changes, f"Add songs v{version} (+{len(added)})")
         with publish_lock:
@@ -903,7 +1107,7 @@ def songs_batch_commit(bid):
         app.logger.exception("songs batch commit failed")
         with publish_lock:
             if bid in song_batches:
-                song_batches[bid]["status"] = "open"  # allow retry; live tree unchanged
+                song_batches[bid]["status"] = "open"
                 song_batches[bid]["error"] = str(ex)
         return error(str(ex), 502)
 
@@ -981,18 +1185,25 @@ def songs_delete(sid):
     try:
         idx, songs = gh.load_songs_list()
         old_count = len(songs)
+        removed = next((s for s in songs if s["id"] == sid), None)
         songs = [s for s in songs if s["id"] != sid]
         if len(songs) == old_count:
             return error("Song not found", 404)
         version = int(idx.get("version") or 0) + 1
+        store_items = [it for it in (idx.get("items") or []) if it.get("id") != sid]
         changes = gh.build_song_pages(songs)
         changes.update(gh.songs_page_deletes(old_count, len(songs)))
         changes[f"{gh.SONGS_PREFIX}{sid}.mp3"] = None
         changes[gh.SONGS_PREFIX + "index.json"] = json.dumps(
-            {"version": version, "count": len(songs), "pageSize": gh.SONGS_PAGE_SIZE},
+            {"version": version, "count": len(songs), "pageSize": gh.SONGS_PAGE_SIZE, "items": store_items},
             ensure_ascii=True, separators=(",", ":"),
         ).encode()
         sha = gh.atomic_update(changes, f"Delete song {sid} v{version}")
+        if removed:
+            try:
+                storage.delete_stored(removed)
+            except Exception:
+                app.logger.exception("song storage delete failed")
     except Exception as ex:
         return error(str(ex), 502)
     return jsonify(ok=True, commit=sha, version=version, count=len(songs))

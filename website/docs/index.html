@@ -46,6 +46,7 @@
     <button type="button" data-tab="hadith">Hadith</button>
     <button type="button" data-tab="qa">Q&amp;A</button>
     <button type="button" data-tab="songs">Songs</button>
+    <button type="button" data-tab="storage">Storage</button>
     <button type="button" data-tab="api">API &amp; Test</button>
   </nav>
 
@@ -99,11 +100,31 @@
     <div class="box"><b>Live list</b><div id="qaLive"></div></div>
   </section>
 
+  <section id="tab-storage" hidden>
+    <div class="box">
+      <b>Default audio storage</b>
+      <p class="hint">New uploads use this provider. Existing items keep their current source.</p>
+      <select id="storageDefault"></select>
+      <button type="button" id="storageSave">Save default</button>
+      <p id="storageMsg" class="hint"></p>
+    </div>
+    <div id="storageProviders"></div>
+  </section>
+
   <section id="tab-songs" hidden>
     <div class="box">
       <b>Upload Arabic Songs</b>
       <p class="hint">MP3 only, max 10 MB and 128 kbps each. ID3 / cover art stripped on server.</p>
+      <label class="row"><span>Upload to</span>
+        <select id="songsProvider">
+          <option value="default">Default storage</option>
+          <option value="github">GitHub</option>
+          <option value="cloudinary">Cloudinary</option>
+          <option value="s3">S3-compatible</option>
+        </select>
+      </label>
       <input id="songsFiles" type="file" accept="audio/mpeg,.mp3" multiple>
+      <p class="hint">Or paste direct HTTPS MP3 links below (one per pending row).</p>
       <div id="songsUploadList"></div>
       <button type="button" id="songsUploadBtn" disabled>Upload selected</button>
       <p id="songsUploadProg" class="hint"></p>
@@ -153,7 +174,8 @@ let meta = { methods: [], asr_options: [], high_lat: [] };
 let hadithRows = null, qaRows = null;
 let hurufBatchFiles = [];
 let songsCache = [];
-let songsPending = []; // {file, title, artist, status, error, client_id}
+let songsPending = []; // {file, link, title, artist, status, error, client_id}
+let storageInfo = { default: "github", providers: [] };
 
 async function call(path, method = "GET", body) {
   const r = await fetch(API + "/api/admin" + path, {
@@ -287,28 +309,36 @@ async function loadDevices() {
   $("list").replaceChildren(...d.devices.map(deviceCard));
 }
 
+function providerSelect(id) {
+  const s = el("select", { id: id || undefined });
+  [["default","Default storage"],["github","GitHub"],["cloudinary","Cloudinary"],["s3","S3-compatible"]]
+    .forEach(([v, t]) => s.appendChild(el("option", { value: v, text: t })));
+  return s;
+}
 function mp3Card(title, fileKey, statusObj, onUpload) {
   const box = el("div");
   box.appendChild(el("b", { text: title }));
   const st = el("p", { class: "hint" });
-  if (statusObj) st.textContent = `${fileKey}: ${statusObj.size} bytes (sha ${statusObj.sha})`;
-  else st.textContent = `${fileKey}: not uploaded yet`;
+  if (statusObj && statusObj.present) {
+    st.textContent = `${fileKey}: ${statusObj.source || "?"} · ${fmtBytes(statusObj.size)}`;
+  } else st.textContent = `${fileKey}: not set yet`;
   box.appendChild(st);
   if (statusObj && statusObj.url) {
     const a = el("audio", { controls: "controls", preload: "none" });
     a.src = statusObj.url;
     box.appendChild(a);
   }
+  const prov = providerSelect();
+  const link = el("input", { type: "url", maxlength: "250", placeholder: "Or paste https://…mp3 link" });
   const input = el("input", { type: "file", accept: "audio/mpeg,.mp3" });
   const btn = el("button", { type: "button", text: "Upload / replace" });
   btn.onclick = () => run(async () => {
-    if (!input.files[0]) throw new Error("Choose an MP3 first");
-    await onUpload(input.files[0]);
-    input.value = "";
-    setMsg(fileKey + " uploaded.", true);
+    await onUpload({ file: input.files[0] || null, link: link.value.trim(), provider: prov.value });
+    input.value = ""; link.value = "";
+    setMsg(fileKey + " updated.", true);
     await loadAdhan();
   });
-  box.append(input, btn);
+  box.append(labeled("Storage", prov), labeled("Paste link", link), input, btn);
   return box;
 }
 
@@ -316,12 +346,18 @@ async function loadAdhan() {
   const d = await call("/content/adhan");
   $("cardAdhan").replaceChildren();
   $("cardFajr").replaceChildren();
-  $("cardAdhan").appendChild(mp3Card("Normal Adhan", "adhan.mp3", d.files["adhan.mp3"], async file => {
-    const fd = new FormData(); fd.append("kind", "adhan"); fd.append("file", file, file.name);
+  $("cardAdhan").appendChild(mp3Card("Normal Adhan", "adhan.mp3", d.files["adhan.mp3"], async opts => {
+    const fd = new FormData(); fd.append("kind", "adhan"); fd.append("provider", opts.provider);
+    if (opts.link) fd.append("link", opts.link);
+    else if (opts.file) fd.append("file", opts.file, opts.file.name);
+    else throw new Error("Choose an MP3 or paste a link");
     await upload("/content/adhan", fd);
   }));
-  $("cardFajr").appendChild(mp3Card("Fajr Adhan", "fajr.mp3", d.files["fajr.mp3"], async file => {
-    const fd = new FormData(); fd.append("kind", "fajr"); fd.append("file", file, file.name);
+  $("cardFajr").appendChild(mp3Card("Fajr Adhan", "fajr.mp3", d.files["fajr.mp3"], async opts => {
+    const fd = new FormData(); fd.append("kind", "fajr"); fd.append("provider", opts.provider);
+    if (opts.link) fd.append("link", opts.link);
+    else if (opts.file) fd.append("file", opts.file, opts.file.name);
+    else throw new Error("Choose an MP3 or paste a link");
     await upload("/content/adhan", fd);
   }));
 }
@@ -339,17 +375,23 @@ async function loadHuruf() {
       a.src = slot.url;
       box.appendChild(a);
     }
+    box.appendChild(el("p", { class: "hint", text: slot.source ? ("Source: " + slot.source) : "Source: (default path)" }));
+    const prov = providerSelect();
+    const link = el("input", { type: "url", maxlength: "250", placeholder: "Or paste https://…mp3 link" });
     const input = el("input", { type: "file", accept: "audio/mpeg,.mp3" });
     const btn = el("button", { type: "button", text: "Upload / replace" });
     btn.onclick = () => run(async () => {
-      if (!input.files[0]) throw new Error("Choose an MP3");
       const fd = new FormData();
       fd.append("n", String(slot.n));
-      fd.append("file", input.files[0], input.files[0].name);
+      fd.append("provider", prov.value);
+      if (link.value.trim()) fd.append("link", link.value.trim());
+      else if (input.files[0]) fd.append("file", input.files[0], input.files[0].name);
+      else throw new Error("Choose an MP3 or paste a link");
       await upload("/content/huruf", fd);
-      setMsg(`Huruf ${slot.n} uploaded.`, true);
+      setMsg(`Huruf ${slot.n} updated.`, true);
       await loadHuruf();
     });
+    box.append(labeled("Storage", prov), labeled("Paste link", link));
     if (hurufBatchFiles.length) {
       const assign = el("select");
       assign.appendChild(el("option", { value: "", text: "Assign batch file…" }));
@@ -499,14 +541,17 @@ function renderSongsPending() {
   box.replaceChildren();
   songsPending.forEach((row, i) => {
     const wrap = el("div", { class: "upload-row" });
-    wrap.appendChild(el("p", { class: "hint", text: row.file.name + " (" + fmtBytes(row.file.size) + ")" }));
+    wrap.appendChild(el("p", { class: "hint", text: row.file ? (row.file.name + " (" + fmtBytes(row.file.size) + ")") : "(paste link)" }));
     const title = el("input", { type: "text", maxlength: "60", placeholder: "Title (required)" });
     title.value = row.title;
     title.oninput = () => { row.title = title.value; };
     const artist = el("input", { type: "text", maxlength: "40", placeholder: "Artist (optional)" });
     artist.value = row.artist;
     artist.oninput = () => { row.artist = artist.value; };
-    wrap.append(labeled("Title", title), labeled("Artist", artist));
+    const link = el("input", { type: "url", maxlength: "250", placeholder: "Optional: paste https://…mp3 instead of file" });
+    link.value = row.link || "";
+    link.oninput = () => { row.link = link.value; };
+    wrap.append(labeled("Title", title), labeled("Artist", artist), labeled("Paste link", link));
     const st = el("p", { class: "hint" });
     st.textContent = row.status + (row.error ? " — " + row.error : "");
     if (row.error) st.className = "hint err";
@@ -532,7 +577,7 @@ $("songsFiles").onchange = () => {
   const files = Array.from($("songsFiles").files || []);
   files.forEach(f => {
     songsPending.push({
-      file: f, title: suggestSongTitle(f.name), artist: "",
+      file: f, link: "", title: suggestSongTitle(f.name), artist: "",
       status: "ready", error: "", client_id: "c" + Math.random().toString(16).slice(2),
       progress: null
     });
@@ -557,7 +602,9 @@ async function uploadOneSong(i, batchId) {
     fd.append("title", row.title.trim());
     fd.append("artist", (row.artist || "").trim());
     fd.append("client_id", row.client_id);
-    fd.append("file", row.file, row.file.name);
+    if ((row.link || "").trim()) fd.append("link", row.link.trim());
+    else if (row.file) fd.append("file", row.file, row.file.name);
+    else throw new Error("Choose an MP3 or paste a link");
     row.progress = 40; renderSongsPending();
     await upload("/songs/batch/" + bid + "/file", fd);
     row.progress = 100; row.status = "ok"; row.error = "";
@@ -573,7 +620,7 @@ async function uploadOneSong(i, batchId) {
 $("songsUploadBtn").onclick = () => run(async () => {
   if (!songsPending.length) throw new Error("Choose MP3 files first");
   $("songsUploadProg").textContent = "Starting batch...";
-  const started = await call("/songs/batch/start", "POST", {});
+  const started = await call("/songs/batch/start", "POST", { provider: $("songsProvider").value });
   if (started.warning) setMsg(started.warning, false);
   const bid = started.batch_id;
   let ok = 0, fail = 0;
@@ -600,7 +647,7 @@ $("songsUploadBtn").onclick = () => run(async () => {
 function songCard(song, idx, list) {
   const box = el("div", { class: "song-row" });
   box.appendChild(el("b", { text: `${idx + 1}. ${song.title}` }));
-  box.appendChild(el("p", { class: "hint", text: (song.artist ? song.artist + " · " : "") + song.id + " · " + fmtBytes(song.size) }));
+  box.appendChild(el("p", { class: "hint", text: (song.artist ? song.artist + " · " : "") + song.id + " · " + (song.source || song.provider || "github") + " · " + fmtBytes(song.size) }));
   if (song.url) {
     const a = el("audio", { controls: "controls", preload: "none" });
     a.src = song.url;
@@ -674,8 +721,44 @@ function renderSongsLive() {
 }
 $("songsSearch").oninput = () => renderSongsLive();
 
+async function loadStorage() {
+  const d = await call("/storage");
+  storageInfo = d;
+  const sel = $("storageDefault");
+  sel.replaceChildren();
+  (d.options || ["github","cloudinary","s3"]).forEach(p => {
+    sel.appendChild(el("option", { value: p, text: p }));
+  });
+  sel.value = d.default || "github";
+  const box = $("storageProviders");
+  box.replaceChildren();
+  (d.providers || []).forEach(p => {
+    const card = el("div", { class: "box" });
+    card.appendChild(el("b", { text: p.label || p.id }));
+    card.appendChild(el("p", { class: "hint", text: p.configured ? "Configured" : "Not configured" }));
+    if (p.cloud) card.appendChild(el("p", { class: "hint", text: "Cloud: " + p.cloud }));
+    if (p.bucket) card.appendChild(el("p", { class: "hint", text: "Bucket: " + p.bucket }));
+    if (p.repo) card.appendChild(el("p", { class: "hint", text: "Repo: " + p.repo }));
+    const btn = el("button", { type: "button", text: "Test connection" });
+    const out = el("p", { class: "hint" });
+    btn.onclick = () => run(async () => {
+      const r = await call("/storage/test", "POST", { provider: p.id });
+      out.textContent = r.detail || "OK";
+      out.className = "hint ok";
+    });
+    card.append(btn, out);
+    box.appendChild(card);
+  });
+}
+$("storageSave").onclick = () => run(async () => {
+  await call("/storage", "POST", { audio_provider: $("storageDefault").value });
+  $("storageMsg").textContent = "Default saved. New uploads only.";
+  $("storageMsg").className = "hint ok";
+  await loadStorage();
+});
+
 function showTab(name) {
-  ["devices","adhan","huruf","hadith","qa","songs","api"].forEach(t => {
+  ["devices","adhan","huruf","hadith","qa","songs","storage","api"].forEach(t => {
     $("tab-" + t).hidden = t !== name;
   });
   document.querySelectorAll("nav button").forEach(b => b.classList.toggle("on", b.dataset.tab === name));
@@ -684,6 +767,7 @@ function showTab(name) {
   if (name === "hadith") loadHadithLive().catch(e => setMsg(e.message, false));
   if (name === "qa") loadQaLive().catch(e => setMsg(e.message, false));
   if (name === "songs") loadSongsLive().catch(e => setMsg(e.message, false));
+  if (name === "storage") loadStorage().catch(e => setMsg(e.message, false));
 }
 document.querySelectorAll("nav button").forEach(b => b.onclick = () => showTab(b.dataset.tab));
 

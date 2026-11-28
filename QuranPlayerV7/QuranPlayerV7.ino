@@ -79,7 +79,7 @@
  #define BACKEND_HOST "ruju-zxb0.onrender.com"   // no https://, no slash
  #define PRODUCT_ID   "YOUR_PRODUCT_ID"
  #define DEVICE_TOKEN "YOUR_DEVICE_TOKEN"
- #define FW_VERSION   "7.2"
+ #define FW_VERSION   "7.3"
  // Default content site (dashboard can override per device). No trailing slash.
  #define CONTENT_BASE_URL "https://buxinelectronics-art.github.io/Ruju"
  #define CONTENT_SURAH 255          // Clip.surah for GitHub Pages / content MP3s
@@ -256,7 +256,7 @@
    Status   st;
    AiShared ai;
    char     voiceId[24];        // spoken answer to play (Clip with surah 0)
-   char     contentPath[72];    // relative path for CONTENT_SURAH clips (e.g. adhan/fajr.mp3?v=1)
+   char     contentPath[256];   // relative path OR full https:// URL for CONTENT_SURAH clips
    bool     cfgNew;             // settings received from the dashboard
    int      cfgVolume, cfgReciter;
    uint8_t  beepLeft;           // soft offline beeps requested from the UI
@@ -266,8 +266,8 @@
    bool     docOk;
    uint8_t  docErr;             // 0 ok, 1 wifi, 2 notfound, 3 other
    uint32_t docGen;
-   char     docReq[72];
-   char     docBuf[3200];
+   char     docReq[80];
+   char     docBuf[4096];
  };
  
  // ---- other types (kept up here: the Arduino IDE needs them before any function) ----
@@ -324,6 +324,12 @@
  static uint32_t contentVerHadith = 1;
  static uint32_t contentVerQa = 1;
  static uint32_t contentVerSongs = 1;
+ static uint32_t contentVerMedia = 1;
+ static char mediaCache[4096];
+ static bool mediaCacheOk = false;
+ static char adhanSavedUrl[2][252];   // 0=adhan 1=fajr — survive restarts
+ static char songUrls[10][252];
+ static char itemAudioUrl[252];       // Hadith / Q&A optional absolute URL
  
  // Adhan auto-play runtime (Phase 2)
  enum AdhanRun : uint8_t { AR_IDLE = 0, AR_WAIT_AI = 1, AR_PLAYING = 2, AR_BEEP = 3, AR_HOLD = 4 };
@@ -803,72 +809,145 @@
    unlockSh();
  }
  
+ // Parse https://host/path into host + path (path includes query).
+ static bool parseHttpsUrl(const char* url, char* host, size_t hostSz, char* path, size_t pathSz) {
+   if (!url || strncmp(url, "https://", 8) != 0) return false;
+   const char* h = url + 8;
+   const char* slash = strchr(h, '/');
+   size_t hl = slash ? (size_t)(slash - h) : strlen(h);
+   if (hl == 0 || hl >= hostSz) return false;
+   memcpy(host, h, hl);
+   host[hl] = 0;
+   // strip optional :443
+   char* colon = strchr(host, ':');
+   if (colon) {
+     if (strcmp(colon, ":443") != 0) return false;
+     *colon = 0;
+   }
+   if (slash) snprintf(path, pathSz, "%s", slash);
+   else snprintf(path, pathSz, "/");
+   return host[0] != 0 && path[0] == '/';
+ }
+ 
  // One HTTP request for the rest of the file. Keeps the TLS connection alive.
+ // Content clips may be a relative Pages path or a full https:// URL (any host).
+ // Never sends the device token to a content host. Follows up to 3 redirects.
  static FetchResult fetchOnce(uint32_t gen, const Clip& c, Download& dl) {
    const bool voice = (c.surah == 0);          // AI answer from our backend
    const bool content = (c.surah == CONTENT_SURAH);
    WiFiClientSecure& cl = voice ? aiClient : client;
-   const char* host = voice ? BACKEND_HOST : (content ? contentHost : HOST);
-   if (!cl.connected()) {
-     cl.stop();
-     if (voice || content) cl.useBuiltinCACertBundle(); else cl.setInsecure();
-     cl.setHandshakeTimeout(12);               // seconds
-     if (!cl.connect(host, 443, 8000)) {
-       LOGF("connect failed, heap=%u\n", (unsigned)ESP.getFreeHeap());
-       return FR_RETRY;
-     }
-   }
-   if (stale(gen)) return FR_ABORT;
  
-   char path[160];
+   char hostBuf[96];
+   char path[280];
    char auth[200] = "";
+   bool absContent = false;
+ 
    if (voice) {
+     snprintf(hostBuf, sizeof(hostBuf), "%s", BACKEND_HOST);
      lockSh();
      snprintf(path, sizeof(path), "/api/device/audio/%s", sh.voiceId);
      unlockSh();
      snprintf(auth, sizeof(auth), "Authorization: Bearer %s\r\nX-Product-ID: %s\r\n", DEVICE_TOKEN, PRODUCT_ID);
    } else if (content) {
-     char rel[48];
+     char target[256];
      lockSh();
-     snprintf(rel, sizeof(rel), "%s", sh.contentPath);
+     snprintf(target, sizeof(target), "%s", sh.contentPath);
      unlockSh();
-     if (contentBase[0])
-       snprintf(path, sizeof(path), "%s/%s", contentBase, rel);
-     else
-       snprintf(path, sizeof(path), "/%s", rel);
+     if (strncmp(target, "https://", 8) == 0) {
+       absContent = true;
+       if (!parseHttpsUrl(target, hostBuf, sizeof(hostBuf), path, sizeof(path)))
+         return FR_NOTFOUND;
+     } else {
+       snprintf(hostBuf, sizeof(hostBuf), "%s", contentHost);
+       if (contentBase[0])
+         snprintf(path, sizeof(path), "%s/%s", contentBase, target);
+       else
+         snprintf(path, sizeof(path), "/%s", target);
+     }
    } else {
+     snprintf(hostBuf, sizeof(hostBuf), "%s", HOST);
      snprintf(path, sizeof(path), "/data/%s/%03u%03u.mp3",
               RECITERS[c.reciter].ayahFolder, (unsigned)c.surah, (unsigned)c.ayah);
    }
-   char req[480];
-   int n = snprintf(req, sizeof(req),
-                    "GET %s HTTP/1.1\r\nHost: %s\r\n%s"
-                    "User-Agent: QuranPlayer/6\r\nAccept: */*\r\nAccept-Encoding: identity\r\n"
-                    "Connection: keep-alive\r\n",
-                    path, host, auth);
-   if (dl.received > 0)
-     n += snprintf(req + n, sizeof(req) - n, "Range: bytes=%lu-\r\n", (unsigned long)dl.received);
-   n += snprintf(req + n, sizeof(req) - n, "\r\n");
-   if (cl.write((const uint8_t*)req, n) != (size_t)n) { cl.stop(); return FR_RETRY; }
  
-   // ---- reply headers ----
-   char line[200];
-   if (!readLine(cl, stale, gen, line, sizeof(line), STALL_MS)) { cl.stop(); return stale(gen) ? FR_ABORT : FR_RETRY; }
-   const char* sp = strchr(line, ' ');
-   int code = sp ? atoi(sp + 1) : 0;
-   bool keep = (strncmp(line, "HTTP/1.1", 8) == 0);
+   int redirects = 0;
+   int code = 0;
+   bool keep = true;
    bool chunked = false;
    long contentLen = -1;
    long rangeTotal = -1;
+   char line[200];
+ 
    for (;;) {
+     if (stale(gen)) return FR_ABORT;
+     bool needNew = !cl.connected();
+     // Absolute content URLs may change host after redirects — always reconnect then.
+     if (absContent) needNew = true;
+     if (needNew) {
+       cl.stop();
+       if (voice || content) cl.useBuiltinCACertBundle(); else cl.setInsecure();
+       cl.setHandshakeTimeout(12);
+       if (!cl.connect(hostBuf, 443, 8000)) {
+         LOGF("connect failed, heap=%u\n", (unsigned)ESP.getFreeHeap());
+         return FR_RETRY;
+       }
+     }
+     if (stale(gen)) return FR_ABORT;
+ 
+     char req[520];
+     // Content hosts never receive the device token (auth is empty unless voice).
+     int n = snprintf(req, sizeof(req),
+                      "GET %s HTTP/1.1\r\nHost: %s\r\n%s"
+                      "User-Agent: QuranPlayer/7\r\nAccept: */*\r\nAccept-Encoding: identity\r\n"
+                      "Connection: keep-alive\r\n",
+                      path, hostBuf, auth);
+     if (dl.received > 0)
+       n += snprintf(req + n, sizeof(req) - n, "Range: bytes=%lu-\r\n", (unsigned long)dl.received);
+     n += snprintf(req + n, sizeof(req) - n, "\r\n");
+     if (cl.write((const uint8_t*)req, n) != (size_t)n) { cl.stop(); return FR_RETRY; }
+ 
      if (!readLine(cl, stale, gen, line, sizeof(line), STALL_MS)) { cl.stop(); return stale(gen) ? FR_ABORT : FR_RETRY; }
-     if (!line[0]) break;
-     const char* v;
-     if (headerIs(line, "Content-Length", &v)) contentLen = atol(v);
-     else if (headerIs(line, "Content-Range", &v)) { const char* s = strchr(v, '/'); if (s) rangeTotal = atol(s + 1); }
-     else if (headerIs(line, "Transfer-Encoding", &v)) chunked = (strncasecmp(v, "chunked", 7) == 0);
-     else if (headerIs(line, "Connection", &v)) keep = (strncasecmp(v, "close", 5) != 0);
+     const char* sp = strchr(line, ' ');
+     code = sp ? atoi(sp + 1) : 0;
+     keep = (strncmp(line, "HTTP/1.1", 8) == 0);
+     chunked = false;
+     contentLen = -1;
+     rangeTotal = -1;
+     char location[256] = "";
+     for (;;) {
+       if (!readLine(cl, stale, gen, line, sizeof(line), STALL_MS)) { cl.stop(); return stale(gen) ? FR_ABORT : FR_RETRY; }
+       if (!line[0]) break;
+       const char* v;
+       if (headerIs(line, "Content-Length", &v)) contentLen = atol(v);
+       else if (headerIs(line, "Content-Range", &v)) { const char* s = strchr(v, '/'); if (s) rangeTotal = atol(s + 1); }
+       else if (headerIs(line, "Transfer-Encoding", &v)) chunked = (strncasecmp(v, "chunked", 7) == 0);
+       else if (headerIs(line, "Connection", &v)) keep = (strncasecmp(v, "close", 5) != 0);
+       else if (headerIs(line, "Location", &v)) {
+         while (*v == ' ') v++;
+         snprintf(location, sizeof(location), "%.250s", v);
+       }
+     }
+ 
+     if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
+       cl.stop();
+       if (++redirects > 3) { LOGF("too many redirects\n"); return FR_RETRY; }
+       if (!location[0]) return FR_RETRY;
+       if (location[0] == '/') {
+         // same host, new path
+         snprintf(path, sizeof(path), "%s", location);
+         absContent = content;
+         continue;
+       }
+       if (strncmp(location, "https://", 8) != 0) return FR_RETRY;
+       if (!parseHttpsUrl(location, hostBuf, sizeof(hostBuf), path, sizeof(path))) return FR_RETRY;
+       absContent = content;
+       // Do not follow redirects for voice (token must not leak to another host).
+       if (voice) return FR_RETRY;
+       continue;
+     }
+     break;
    }
+ 
    if (code == 404) { cl.stop(); return FR_NOTFOUND; }
    if (code != 200 && code != 206) { LOGF("HTTP %d\n", code); cl.stop(); return FR_RETRY; }
  
@@ -2627,6 +2706,7 @@
  static void hurufOpen() {
    hurufIdx = 0;
    stopContentAudio();
+   if (!mediaCacheOk) mediaRequest();
  }
  
  static void hadithOpen() {
@@ -2730,11 +2810,14 @@
  static void songsPlayCurrent() {
    if (!songCacheHas(songIdx)) { songsEnsureIdx(); return; }
    int slot = songSlotOf(songIdx);
-   char path[56];
-   snprintf(path, sizeof(path), "songs/%s.mp3?v=%lu",
-            songIds[slot], (unsigned long)contentVerSongs);
    songMode = SONG_PLAY;
-   startContentMp3(path);
+   if (songUrls[slot][0]) startContentMp3(songUrls[slot]);
+   else {
+     char path[56];
+     snprintf(path, sizeof(path), "songs/%s.mp3?v=%lu",
+              songIds[slot], (unsigned long)contentVerSongs);
+     startContentMp3(path);
+   }
  }
  
  static void songsPlayNextOrStop() {
@@ -2758,16 +2841,99 @@
    }
  }
  
+ static bool mediaExtractUrl(const char* json, const char* section, const char* key,
+                             char* out, size_t outSz) {
+   out[0] = 0;
+   if (!json || !section || !key || outSz < 8) return false;
+   char needle[28];
+   snprintf(needle, sizeof(needle), "\"%s\"", section);
+   const char* sec = strstr(json, needle);
+   if (!sec) return false;
+   snprintf(needle, sizeof(needle), "\"%s\"", key);
+   const char* p = strstr(sec, needle);
+   if (!p) return false;
+   p += strlen(needle);
+   while (*p && *p != ':') p++;
+   if (*p != ':') return false;
+   p++;
+   while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') p++;
+   if (*p == '"') {
+     jsonString(p + 1, out, outSz);
+     return out[0] != 0;
+   }
+   if (*p == '{') {
+     char tmp[420];
+     size_t n = 0;
+     int depth = 0;
+     for (const char* q = p; *q && n + 1 < sizeof(tmp); q++) {
+       tmp[n++] = *q;
+       if (*q == '{') depth++;
+       else if (*q == '}') {
+         depth--;
+         if (depth == 0) break;
+       }
+     }
+     tmp[n] = 0;
+     return jsonFind(tmp, "url", out, outSz);
+   }
+   return false;
+ }
+ 
+ static void mediaSaveAdhanPrefs() {
+   Preferences p;
+   p.begin("media", false);
+   p.putString("adhan", adhanSavedUrl[0]);
+   p.putString("fajr", adhanSavedUrl[1]);
+   p.putULong("mver", contentVerMedia);
+   p.end();
+ }
+ 
+ static void mediaLoadAdhanPrefs() {
+   Preferences p;
+   p.begin("media", true);
+   String a = p.getString("adhan", "");
+   String f = p.getString("fajr", "");
+   contentVerMedia = p.getULong("mver", 1);
+   p.end();
+   snprintf(adhanSavedUrl[0], sizeof(adhanSavedUrl[0]), "%s", a.c_str());
+   snprintf(adhanSavedUrl[1], sizeof(adhanSavedUrl[1]), "%s", f.c_str());
+ }
+ 
+ static void mediaRequest() {
+   char path[64];
+   snprintf(path, sizeof(path), "media.json?v=%lu", (unsigned long)contentVerMedia);
+   docRequest(path);
+ }
+ 
+ static void startContentAudio(const char* relOrUrl) {
+   startContentMp3(relOrUrl);
+ }
+ 
  static void contentPollDocs() {
    lockSh();
    bool done = sh.docDone;
    bool ok = sh.docOk;
    uint8_t err = sh.docErr;
-   static char buf[3200];
+   static char buf[4096];
    if (done) memcpy(buf, sh.docBuf, sizeof(buf));
    sh.docDone = false;
    unlockSh();
    if (!done) return;
+ 
+   // media.json may arrive on any screen (boot / Adhan / Huruf refresh)
+   if (strstr(buf, "\"adhan\"") && strstr(buf, "\"huruf\"") && !strstr(buf, "\"songs\"")) {
+     contentVerMedia = (uint32_t)jsonInt(buf, "\"version\"", (int)contentVerMedia);
+     memcpy(mediaCache, buf, sizeof(mediaCache));
+     mediaCacheOk = true;
+     char u0[252], u1[252];
+     if (mediaExtractUrl(buf, "adhan", "adhan", u0, sizeof(u0)))
+       snprintf(adhanSavedUrl[0], sizeof(adhanSavedUrl[0]), "%s", u0);
+     if (mediaExtractUrl(buf, "adhan", "fajr", u1, sizeof(u1)))
+       snprintf(adhanSavedUrl[1], sizeof(adhanSavedUrl[1]), "%s", u1);
+     mediaSaveAdhanPrefs();
+     dirty = true;
+     return;
+   }
  
    if (screen == SCR_HADITH) {
      if (!ok) {
@@ -2795,6 +2961,8 @@
      jsonFind(buf, "title", hadithTitle, sizeof(hadithTitle));
      jsonFind(buf, "text", hadithText, sizeof(hadithText));
      jsonFind(buf, "source", hadithSource, sizeof(hadithSource));
+     itemAudioUrl[0] = 0;
+     jsonFind(buf, "url", itemAudioUrl, sizeof(itemAudioUrl));
      wrapLines(hadithText, hadithLine, 40, &hadithLines);
      hadithPhase = LP_READY;
      dirty = true;
@@ -2831,6 +2999,8 @@
      jsonFind(buf, "question", qaQuestion, sizeof(qaQuestion));
      jsonFind(buf, "answer", qaAnswer, sizeof(qaAnswer));
      jsonFind(buf, "source", qaSource, sizeof(qaSource));
+     itemAudioUrl[0] = 0;
+     jsonFind(buf, "url", itemAudioUrl, sizeof(itemAudioUrl));
      char combined[1808];
      snprintf(combined, sizeof(combined), "Q: %s\n%s", qaQuestion, qaAnswer);
      wrapLines(combined, qaLine, 48, &qaLines);
@@ -2861,13 +3031,15 @@
        songPageCount = 0;
        const char* p = buf;
        while (songPageCount < 10 && (p = strstr(p, "\"id\"")) != nullptr) {
-         char id[8], title[62], artist[42];
+         char id[8], title[62], artist[42], url[252];
          if (!jsonFind(p, "id", id, sizeof(id))) { p += 4; continue; }
          if (!jsonFind(p, "title", title, sizeof(title))) title[0] = 0;
          if (!jsonFind(p, "artist", artist, sizeof(artist))) artist[0] = 0;
+         if (!jsonFind(p, "url", url, sizeof(url))) url[0] = 0;
          snprintf(songIds[songPageCount], sizeof(songIds[0]), "%s", id);
          snprintf(songTitles[songPageCount], sizeof(songTitles[0]), "%s", title);
          snprintf(songArtists[songPageCount], sizeof(songArtists[0]), "%s", artist);
+         snprintf(songUrls[songPageCount], sizeof(songUrls[0]), "%s", url);
          songPageCount++;
          p += 4;
        }
@@ -3471,12 +3643,16 @@
    contentPlaying = false;
    if (screen == SCR_SONGS) songMode = SONG_LIST;
 
-   const char* file = (prayerId == PT_FAJR) ? "adhan/fajr.mp3" : "adhan/adhan.mp3";
+   const bool fajr = (prayerId == PT_FAJR);
+   const char* saved = adhanSavedUrl[fajr ? 1 : 0];
+   char file[256];
+   if (saved[0]) snprintf(file, sizeof(file), "%s", saved);
+   else snprintf(file, sizeof(file), "%s", fajr ? "adhan/fajr.mp3" : "adhan/adhan.mp3");
    lockSh();
    snprintf(sh.contentPath, sizeof(sh.contentPath), "%s", file);
    unlockSh();
  
-   Clip c = { CONTENT_SURAH, (uint16_t)((prayerId == PT_FAJR) ? 2 : 1), 0 };
+   Clip c = { CONTENT_SURAH, (uint16_t)(fajr ? 2 : 1), 0 };
    playGen = playerStart(c, false);
    session = true;
    paused = false;
@@ -3729,6 +3905,7 @@
            goScreen(SCR_AYAHS);             // Ustaz = single ayah
          } else if (homeSel == 2) {
            adhanScroll = 0;
+           mediaRequest();
            goScreen(SCR_ADHAN);
          } else if (homeSel == 3) {
            hurufOpen();
@@ -3762,8 +3939,12 @@
        } else if (k == KEY3) {
          if (contentPlaying) stopContentAudio();
          else {
-           char path[40];
-           snprintf(path, sizeof(path), "huruf/%02d.mp3", hurufIdx + 1);
+           char path[256];
+           char key[4];
+           snprintf(key, sizeof(key), "%02d", hurufIdx + 1);
+           path[0] = 0;
+           if (mediaCacheOk) mediaExtractUrl(mediaCache, "huruf", key, path, sizeof(path));
+           if (!path[0]) snprintf(path, sizeof(path), "huruf/%02d.mp3", hurufIdx + 1);
            startContentMp3(path);
          }
        }
@@ -3773,6 +3954,7 @@
        if (hadithPhase != LP_READY) break;
        if (k == KEY3) {
          if (contentPlaying) stopContentAudio();
+         else if (itemAudioUrl[0]) startContentMp3(itemAudioUrl);
          else {
            char path[48];
            uint16_t num = hadithNums[hadithIdx];
@@ -3809,6 +3991,7 @@
        } else if (qaPhase == LP_READY) {
          if (k == KEY3) {
            if (contentPlaying) stopContentAudio();
+           else if (itemAudioUrl[0]) startContentMp3(itemAudioUrl);
            else {
              char path[64];
              snprintf(path, sizeof(path), "qa/%s/%03d.mp3?v=%lu",
@@ -3952,6 +4135,7 @@
    contentParseUrl(ds.contentUrl);
    timeApplyZone();
    adhanLoadFired();
+   mediaLoadAdhanPrefs();
  
    mtx = xSemaphoreCreateMutex();
    keyQueue = xQueueCreate(24, sizeof(KeyEvent));

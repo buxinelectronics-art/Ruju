@@ -12,6 +12,9 @@
   - `GITHUB_BRANCH=main`
   - `DEFAULT_CONTENT_URL=https://buxinelectronics-art.github.io/Ruju`
   - optional `FRONTEND_ORIGIN=https://buxinelectronics-art.github.io`
+  - optional Cloudinary: `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`
+  - optional S3/R2/B2: `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_PUBLIC_URL`
+    (optional `S3_REGION`, default `auto`)
 
 ## GitHub Pages
 - Workflow deploys `website/docs` on push to `main`.

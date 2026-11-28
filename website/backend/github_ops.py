@@ -19,6 +19,7 @@ ALLOWED = (
     "website/docs/adhan/", "website/docs/huruf/", "website/docs/hadith/",
     "website/docs/qa/", "website/docs/songs/",
 )
+ALLOWED_FILES = ("website/docs/media.json",)
 SONGS_PREFIX = "website/docs/songs/"
 SONGS_PAGE_SIZE = 10
 SONGS_PAGE_MAX_BYTES = 3000
@@ -50,9 +51,11 @@ def headers() -> dict:
 
 def assert_path(path: str) -> str:
     path = path.replace("\\", "/").lstrip("/")
-    if ".." in path.split("/") or not path.startswith(ALLOWED):
+    if ".." in path.split("/"):
         raise ValueError("path not allowed")
-    return path
+    if path in ALLOWED_FILES or path.startswith(ALLOWED):
+        return path
+    raise ValueError("path not allowed")
 
 
 def _url(path: str) -> str:
@@ -557,11 +560,25 @@ def load_songs_list() -> tuple[dict[str, Any], list[dict[str, str]]]:
         obj = json.loads(raw.decode("utf-8"))
         for s in obj.get("songs") or []:
             if isinstance(s, dict) and s.get("id"):
-                songs.append({
+                item = {
                     "id": str(s["id"]),
                     "title": str(s.get("title") or "")[:60],
                     "artist": str(s.get("artist") or "")[:40],
-                })
+                }
+                if s.get("url"):
+                    item["url"] = str(s["url"])[:250]
+                if s.get("provider"):
+                    item["provider"] = str(s["provider"])[:20]
+                if s.get("key"):
+                    item["key"] = str(s["key"])[:160]
+                songs.append(item)
+    # Merge store meta from index.items if present (provider/key for admin delete).
+    by_id = {it.get("id"): it for it in (idx.get("items") or []) if isinstance(it, dict)}
+    for s in songs:
+        meta = by_id.get(s["id"]) or {}
+        for k in ("provider", "key", "size"):
+            if meta.get(k) and not s.get(k):
+                s[k] = meta[k]
     return idx, songs
 
 
@@ -583,18 +600,28 @@ def build_song_pages(songs: list[dict[str, str]]) -> dict[str, bytes]:
     pages = (len(songs) + page_size - 1) // page_size
     for p in range(1, pages + 1):
         chunk = songs[(p - 1) * page_size:p * page_size]
-        payload = {"songs": [{"id": s["id"], "title": s["title"], "artist": s.get("artist") or ""} for s in chunk]}
-        raw = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode()
+
+        def _page_bytes(items):
+            rows = []
+            for s in items:
+                row = {"id": s["id"], "title": s["title"], "artist": s.get("artist") or ""}
+                if s.get("url"):
+                    row["url"] = str(s["url"])[:250]
+                rows.append(row)
+            return json.dumps({"songs": rows}, ensure_ascii=True, separators=(",", ":")).encode()
+
+        raw = _page_bytes(chunk)
         if len(raw) > SONGS_PAGE_MAX_BYTES:
-            # shorten artists first, then titles
             for s in chunk:
                 if len(raw) <= SONGS_PAGE_MAX_BYTES:
                     break
                 s["artist"] = (s.get("artist") or "")[:20]
-                payload = {"songs": [{"id": x["id"], "title": x["title"], "artist": x.get("artist") or ""} for x in chunk]}
-                raw = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode()
+                raw = _page_bytes(chunk)
             if len(raw) > SONGS_PAGE_MAX_BYTES:
-                raise ValueError(f"page{p:03d}.json would exceed {SONGS_PAGE_MAX_BYTES} bytes")
+                raise ValueError(
+                    f"page{p:03d}.json would exceed {SONGS_PAGE_MAX_BYTES} bytes "
+                    "(shorten titles or audio URLs)"
+                )
         files[f"{SONGS_PREFIX}page{p:03d}.json"] = raw
     return files
 
