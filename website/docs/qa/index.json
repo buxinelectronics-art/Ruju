@@ -10,6 +10,11 @@
       "id": "quran",
       "name": "Quran",
       "count": 10
+    },
+    {
+      "id": "prophet-muhammad",
+      "name": "Prophet Muhammad",
+      "count": 10
     }
   ]
 }
