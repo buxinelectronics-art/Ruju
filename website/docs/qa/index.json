@@ -1,1 +1,10 @@
-{"version": 0, "topics": []}
+{
+  "version": 1,
+  "topics": [
+    {
+      "id": "faith",
+      "name": "Faith",
+      "count": 10
+    }
+  ]
+}
