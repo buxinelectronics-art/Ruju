@@ -34,7 +34,12 @@
     {
       "id": "zakat",
       "name": "Zakat",
-      "count": 4
+      "count": 6
+    },
+    {
+      "id": "hajj",
+      "name": "Hajj",
+      "count": 8
     }
   ]
 }
