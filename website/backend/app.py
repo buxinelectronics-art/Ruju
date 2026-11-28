@@ -1130,6 +1130,100 @@ def _songs_storage_payload(stats=None):
         "blocked": docs >= gh.DOCS_BLOCK_BYTES,
     }
 
+@app.post("/api/admin/songs/links/preview")
+def songs_links_preview():
+    """Parse bulk song links without downloading (preview only)."""
+    if (e := need_github()):
+        return e
+    text = str(body().get("text") or "")
+    rows, errors = storage.parse_song_link_lines(text)
+    return jsonify(ok=not errors, rows=rows, errors=errors, count=len(rows))
+
+
+@app.post("/api/admin/songs/links")
+def songs_links_save():
+    """Verify HTTPS MP3 links and append them to the songs library in one commit."""
+    if (e := need_github()):
+        return e
+    d = body()
+    text = str(d.get("text") or "")
+    rows = d.get("rows")
+    if isinstance(rows, list) and rows:
+        parsed = []
+        errors = []
+        for i, r in enumerate(rows, start=1):
+            title = str((r or {}).get("title") or "").strip()
+            artist = str((r or {}).get("artist") or "").strip()
+            url = str((r or {}).get("url") or "").strip()
+            if (err := gh.song_title_ok(title)):
+                errors.append(f"Row {i}: {err}")
+                continue
+            if (err := gh.song_artist_ok(artist)):
+                errors.append(f"Row {i}: {err}")
+                continue
+            try:
+                from storage.link_fetch import assert_safe_url
+                assert_safe_url(url)
+            except Exception as ex:
+                errors.append(f"Row {i}: {ex}")
+                continue
+            parsed.append({"title": title, "artist": artist, "url": url})
+        if errors:
+            return error("; ".join(errors[:8]), 400)
+        rows = parsed
+    else:
+        rows, errors = storage.parse_song_link_lines(text)
+        if errors:
+            return jsonify(ok=False, errors=errors), 400
+    if not rows:
+        return error("No links to save", 400)
+    try:
+        verified = []
+        for r in rows:
+            stored = storage.register_link(r["url"], max_kbps=gh.SONG_MP3_MAX_KBPS)
+            verified.append({
+                "title": r["title"], "artist": r.get("artist") or "",
+                "provider": stored.provider, "url": stored.url, "key": "",
+                "size": stored.size, "sha": "",
+            })
+        idx, songs = gh.load_songs_list()
+        old_count = len(songs)
+        nid = gh.next_song_id(songs)
+        added = []
+        changes = {}
+        store_items = [it for it in (idx.get("items") or []) if isinstance(it, dict)]
+        for it in verified:
+            sid = f"s{nid:04d}"
+            nid += 1
+            song = {
+                "id": sid, "title": it["title"], "artist": it.get("artist") or "",
+                "url": it["url"], "provider": it.get("provider") or "link",
+            }
+            songs.append(song)
+            store_items.append({
+                "id": sid, "provider": song["provider"], "key": "", "size": it.get("size") or 0,
+            })
+            added.append({"id": sid, "title": song["title"], "url": song["url"]})
+        version = int(idx.get("version") or 0) + 1
+        pages = gh.build_song_pages(songs)
+        changes.update(pages)
+        changes.update(gh.songs_page_deletes(old_count, len(songs)))
+        index = {
+            "version": version, "count": len(songs), "pageSize": gh.SONGS_PAGE_SIZE,
+            "items": store_items,
+        }
+        changes[gh.SONGS_PREFIX + "index.json"] = json.dumps(
+            index, ensure_ascii=True, separators=(",", ":")
+        ).encode()
+        sha = gh.atomic_update(changes, f"Add song links v{version} (+{len(added)})")
+    except StorageError as ex:
+        return error(str(ex), 400)
+    except Exception as ex:
+        app.logger.exception("songs links save failed")
+        return error(str(ex), 502)
+    return jsonify(ok=True, commit=sha, version=version, count=len(songs), added=added)
+
+
 @app.get("/api/admin/songs")
 def songs_list():
     if (e := need_github()):

@@ -184,3 +184,80 @@ def parse_huruf_link_lines(text: str) -> tuple[list[dict[str, Any]], list[str]]:
     if not rows and not errors:
         errors.append("No valid letter links found")
     return rows, errors
+
+
+def _title_from_song_url(url: str) -> str:
+    from urllib.parse import urlparse, unquote
+    path = unquote(urlparse(url).path or "")
+    name = path.rsplit("/", 1)[-1] if path else ""
+    name = re.sub(r"\.mp3$", "", name, flags=re.I)
+    name = re.sub(r"[_\-]+", " ", name).strip()
+    name = re.sub(r"[^A-Za-z0-9 .'\-,!?()]", "", name).strip()
+    if not name or not re.search(r"[A-Za-z]", name):
+        name = "Song"
+    return name[:60]
+
+
+def parse_song_link_lines(text: str) -> tuple[list[dict[str, Any]], list[str]]:
+    """Parse bulk song links. Formats (one per line):
+    Title | Artist | https://…mp3
+    Title | https://…mp3
+    https://…mp3
+    """
+    rows: list[dict[str, Any]] = []
+    errors: list[str] = []
+    if not (text or "").strip():
+        return [], ["Paste at least one line: Title | Artist | https://…mp3"]
+    for i, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Prefer pipe-separated fields; also accept a lone URL.
+        url = ""
+        title = ""
+        artist = ""
+        if "|" in line:
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) >= 3:
+                title, artist, url = parts[0], parts[1], parts[2]
+            elif len(parts) == 2:
+                a, b = parts
+                if b.lower().startswith("https://"):
+                    title, url = a, b
+                elif a.lower().startswith("https://"):
+                    url, title = a, b
+                else:
+                    errors.append(f"Line {i}: need a https://…mp3 URL (got: {line[:60]})")
+                    continue
+            else:
+                errors.append(f"Line {i}: use Title | Artist | https://…mp3")
+                continue
+        else:
+            m = re.search(r"(https://\S+)", line, re.I)
+            if not m:
+                errors.append(f"Line {i}: missing https://…mp3 URL")
+                continue
+            url = m.group(1).strip()
+            before = line[: m.start()].strip(" -|")
+            title = before
+        url = url.split()[0].strip()
+        try:
+            assert_safe_url(url)
+        except StorageError as ex:
+            errors.append(f"Line {i}: {ex}")
+            continue
+        if not title:
+            title = _title_from_song_url(url)
+        if (err := gh.song_title_ok(title)):
+            errors.append(f"Line {i}: {err}")
+            continue
+        if (err := gh.song_artist_ok(artist)):
+            errors.append(f"Line {i}: {err}")
+            continue
+        rows.append({"title": title.strip(), "artist": (artist or "").strip(), "url": url})
+    if len(rows) > 200:
+        errors.append("Max 200 song links per paste")
+        rows = rows[:200]
+    if not rows and not errors:
+        errors.append("No valid song links found")
+    return rows, errors

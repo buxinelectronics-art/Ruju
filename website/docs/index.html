@@ -159,6 +159,16 @@
 
   <section id="tab-songs" hidden>
     <div class="box">
+      <b>Bulk paste song links</b>
+      <p class="hint">One song per line (same idea as Huruf). HTTPS direct MP3 only, max 128 kbps.<br>
+        <code>Title | Artist | https://…mp3</code> · or <code>Title | https://…mp3</code> · or just the URL.</p>
+      <textarea id="songsLinksText" rows="8" placeholder="Ya Rabbi | Nasheed Artist | https://example.com/ya-rabbi.mp3&#10;Another Song | https://example.com/song2.mp3&#10;https://example.com/song3.mp3"></textarea>
+      <button type="button" id="songsLinksPreview">Preview</button>
+      <button type="button" id="songsLinksSave" disabled>Save links</button>
+      <p id="songsLinksProg" class="hint"></p>
+      <div id="songsLinksPreviewOut"></div>
+    </div>
+    <div class="box">
       <b>Upload Arabic Songs</b>
       <p class="hint">MP3 only, max 10 MB and 128 kbps each. ID3 / cover art stripped on server.</p>
       <label class="row"><span>Upload to</span>
@@ -170,7 +180,7 @@
         </select>
       </label>
       <input id="songsFiles" type="file" accept="audio/mpeg,.mp3" multiple>
-      <p class="hint">Or paste direct HTTPS MP3 links below (one per pending row).</p>
+      <p class="hint">Or paste a single HTTPS MP3 link on each pending file row below.</p>
       <div id="songsUploadList"></div>
       <button type="button" id="songsUploadBtn" disabled>Upload selected</button>
       <p id="songsUploadProg" class="hint"></p>
@@ -234,6 +244,7 @@ let meta = { methods: [], asr_options: [], high_lat: [] };
 let hadithRows = null, qaRows = null;
 let hurufBatchFiles = [];
 let hurufLinkRows = null;
+let songsLinkRows = null;
 let songsCache = [];
 let songsPending = []; // {file, link, title, artist, status, error, client_id}
 let storageInfo = { default: "github", providers: [] };
@@ -771,6 +782,36 @@ function suggestSongTitle(name) {
   if (!/[A-Za-z]/.test(t)) t = "Song";
   return t.slice(0, 60);
 }
+$("songsLinksPreview").onclick = () => run(async () => {
+  const text = $("songsLinksText").value;
+  const d = await call("/songs/links/preview", "POST", { text });
+  const out = $("songsLinksPreviewOut");
+  out.replaceChildren();
+  if (d.errors && d.errors.length) {
+    d.errors.forEach(e => out.appendChild(el("p", { class: "err", text: e })));
+    songsLinkRows = null;
+    $("songsLinksSave").disabled = true;
+    $("songsLinksProg").textContent = "";
+  } else {
+    out.appendChild(el("p", { class: "ok", text: `OK — ${d.count} song links` }));
+    out.appendChild(previewTable(d.rows, ["title", "artist", "url"]));
+    songsLinkRows = d.rows;
+    $("songsLinksSave").disabled = false;
+    $("songsLinksProg").textContent = "Preview OK. Click Save links to verify MP3s and publish.";
+  }
+});
+$("songsLinksSave").onclick = () => run(async () => {
+  if (!songsLinkRows || !songsLinkRows.length) throw new Error("Preview the links first");
+  $("songsLinksProg").textContent = "Verifying MP3s and saving…";
+  const d = await call("/songs/links", "POST", { rows: songsLinkRows });
+  $("songsLinksProg").textContent =
+    `Saved ${ (d.added || []).length } links (library v${d.version}, total ${d.count}).`;
+  setMsg("Song links published.", true);
+  $("songsLinksSave").disabled = true;
+  songsLinkRows = null;
+  await loadSongsLive();
+});
+
 function renderSongsPending() {
   const box = $("songsUploadList");
   box.replaceChildren();
