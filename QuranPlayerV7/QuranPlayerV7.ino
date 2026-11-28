@@ -66,6 +66,7 @@
  #include "libhelix-mp3/mp3dec.h"
  #include <math.h>
  #include <time.h>
+ #include "huruf_bitmaps.h"
  
  // Wi-Fi is NOT written in the code: the owner enters it from a phone.
  #define SETUP_AP_NAME  "Quran Player"
@@ -74,7 +75,7 @@
  #define BACKEND_HOST "ruju-zxb0.onrender.com"   // no https://, no slash
  #define PRODUCT_ID   "QP-D179E0F4"
  #define DEVICE_TOKEN "PwmtsYePeRjc37_lFsyEp-7MsnhPqPVfIwcxut4MHWM"
- #define FW_VERSION   "7.0-p2"
+ #define FW_VERSION   "7.1"
  // Default content site (dashboard can override per device). No trailing slash.
  #define CONTENT_BASE_URL "https://buxinelectronics-art.github.io/Ruju"
  #define CONTENT_SURAH 255          // Clip.surah for GitHub Pages / content MP3s
@@ -251,10 +252,18 @@
    Status   st;
    AiShared ai;
    char     voiceId[24];        // spoken answer to play (Clip with surah 0)
-   char     contentPath[48];    // relative path for CONTENT_SURAH clips (e.g. adhan/fajr.mp3)
+   char     contentPath[72];    // relative path for CONTENT_SURAH clips (e.g. adhan/fajr.mp3?v=1)
    bool     cfgNew;             // settings received from the dashboard
    int      cfgVolume, cfgReciter;
    uint8_t  beepLeft;           // soft offline beeps requested from the UI
+   // Text fetch from content host (index/item JSON). Net task only; never with AI mic.
+   bool     docWant;
+   bool     docDone;
+   bool     docOk;
+   uint8_t  docErr;             // 0 ok, 1 wifi, 2 notfound, 3 other
+   uint32_t docGen;
+   char     docReq[72];
+   char     docBuf[3200];
  };
  
  // ---- other types (kept up here: the Arduino IDE needs them before any function) ----
@@ -282,6 +291,7 @@
  enum MethodId : uint8_t { METH_MWL = 0, METH_ISNA = 1, METH_EGYPT = 2, METH_UMM = 3, METH_KARACHI = 4 };
  enum AsrId : uint8_t { ASR_SHAFI = 0, ASR_HANAFI = 1 };
  enum HighLatId : uint8_t { HL_NONE = 0, HL_MIDNIGHT = 1, HL_ONESEVENTH = 2, HL_ANGLE = 3 };
+ enum DocErr : uint8_t { DOC_OK = 0, DOC_WIFI = 1, DOC_NOTFOUND = 2, DOC_BAD = 3 };
  struct KeyEvent { uint8_t key; uint8_t repeat; };   // repeat 0 = fresh press
  
  // Cloud / Preferences settings used by Adhan and (later) content screens.
@@ -307,6 +317,8 @@
  static int adhanScroll = 0;         // Adhan list scroll (0..1 for 6 rows / 4 visible)
  static char contentHost[64] = "buxinelectronics-art.github.io";
  static char contentBase[64] = "/Ruju";   // path prefix, no trailing slash
+ static uint32_t contentVerHadith = 1;
+ static uint32_t contentVerQa = 1;
  
  // Adhan auto-play runtime (Phase 2)
  enum AdhanRun : uint8_t { AR_IDLE = 0, AR_WAIT_AI = 1, AR_PLAYING = 2, AR_BEEP = 3, AR_HOLD = 4 };
@@ -679,6 +691,111 @@
    } else {
      contentBase[0] = 0;
    }
+ }
+ 
+ static bool docStale(uint32_t gen) {
+   lockSh(); bool s = (gen != sh.docGen) || sh.ai.open || sh.active; unlockSh();
+   return s;
+ }
+ 
+ static void docRequest(const char* relPath) {
+   lockSh();
+   sh.docGen++;
+   snprintf(sh.docReq, sizeof(sh.docReq), "%s", relPath);
+   sh.docWant = true;
+   sh.docDone = false;
+   sh.docOk = false;
+   sh.docErr = DOC_BAD;
+   sh.docBuf[0] = 0;
+   unlockSh();
+ }
+ 
+ static void docCancel() {
+   lockSh();
+   sh.docGen++;
+   sh.docWant = false;
+   sh.docDone = false;
+   unlockSh();
+ }
+ 
+ // Fetch a small JSON/text file from the content host into sh.docBuf.
+ static void docFetchOnce(uint32_t gen) {
+   if (WiFi.status() != WL_CONNECTED) {
+     lockSh();
+     if (gen == sh.docGen) { sh.docDone = true; sh.docOk = false; sh.docErr = DOC_WIFI; sh.docWant = false; }
+     unlockSh();
+     return;
+   }
+   char reqPath[96], rel[72];
+   lockSh(); snprintf(rel, sizeof(rel), "%s", sh.docReq); unlockSh();
+   if (contentBase[0]) snprintf(reqPath, sizeof(reqPath), "%s/%s", contentBase, rel);
+   else snprintf(reqPath, sizeof(reqPath), "/%s", rel);
+ 
+   client.stop();
+   client.useBuiltinCACertBundle();
+   client.setHandshakeTimeout(12);
+   if (!client.connect(contentHost, 443, 8000)) {
+     lockSh();
+     if (gen == sh.docGen) { sh.docDone = true; sh.docOk = false; sh.docErr = DOC_WIFI; sh.docWant = false; }
+     unlockSh();
+     return;
+   }
+   char req[280];
+   int n = snprintf(req, sizeof(req),
+                    "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: QuranPlayer/" FW_VERSION "\r\n"
+                    "Accept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
+                    reqPath, contentHost);
+   if (client.write((const uint8_t*)req, n) != (size_t)n) { client.stop(); return; }
+ 
+   char line[200];
+   if (!readLine(client, docStale, gen, line, sizeof(line), STALL_MS)) { client.stop(); return; }
+   const char* sp = strchr(line, ' ');
+   int code = sp ? atoi(sp + 1) : 0;
+   long contentLen = -1;
+   for (;;) {
+     if (!readLine(client, docStale, gen, line, sizeof(line), STALL_MS)) { client.stop(); return; }
+     if (!line[0]) break;
+     const char* v;
+     if (headerIs(line, "Content-Length", &v)) contentLen = atol(v);
+   }
+   size_t got = 0;
+   uint32_t last = millis();
+   while (contentLen < 0 || (long)got < contentLen) {
+     if (docStale(gen)) { client.stop(); return; }
+     int avail = client.available();
+     if (avail <= 0) {
+       if (!client.connected()) break;
+       if (millis() - last > STALL_MS) break;
+       vTaskDelay(pdMS_TO_TICKS(5));
+       continue;
+     }
+     uint8_t tmp[256];
+     size_t want = (size_t)avail < sizeof(tmp) ? (size_t)avail : sizeof(tmp);
+     if (contentLen >= 0 && (long)(got + want) > contentLen) want = (size_t)(contentLen - (long)got);
+     int r = client.read(tmp, want);
+     if (r <= 0) { vTaskDelay(pdMS_TO_TICKS(2)); continue; }
+     lockSh();
+     if (gen == sh.docGen) {
+       size_t room = sizeof(sh.docBuf) - 1 - got;
+       size_t k = (size_t)r < room ? (size_t)r : room;
+       memcpy(sh.docBuf + got, tmp, k);
+       got += k;
+       sh.docBuf[got] = 0;
+     }
+     unlockSh();
+     last = millis();
+     if (got >= sizeof(sh.docBuf) - 1) break;
+   }
+   client.stop();
+   lockSh();
+   if (gen == sh.docGen) {
+     sh.docDone = true;
+     sh.docWant = false;
+     if (code == 404) { sh.docOk = false; sh.docErr = DOC_NOTFOUND; }
+     else if (code != 200 || got == 0) { sh.docOk = false; sh.docErr = DOC_BAD; }
+     else { sh.docOk = true; sh.docErr = DOC_OK; }
+   }
+   unlockSh();
  }
  
  // One HTTP request for the rest of the file. Keeps the TLS connection alive.
@@ -1324,6 +1441,29 @@
    return m;
  }
  
+ // ESP32 Arduino struct tm has no tm_gmtoff — derive offset from local vs UTC.
+ static double localUtcOffsetHours() {
+   time_t now = time(nullptr);
+   if (now < 1700000000L) return 0.0;
+   struct tm localTm, utcTm;
+   localtime_r(&now, &localTm);
+   gmtime_r(&now, &utcTm);
+   int localSec = localTm.tm_hour * 3600 + localTm.tm_min * 60 + localTm.tm_sec;
+   int utcSec = utcTm.tm_hour * 3600 + utcTm.tm_min * 60 + utcTm.tm_sec;
+   int diff = localSec - utcSec;
+   if (localTm.tm_yday != utcTm.tm_yday || localTm.tm_year != utcTm.tm_year) {
+     // Crossed midnight between the two representations.
+     if (diff < -12 * 3600) diff += 24 * 3600;
+     else if (diff > 12 * 3600) diff -= 24 * 3600;
+     else if (localTm.tm_year > utcTm.tm_year ||
+              (localTm.tm_year == utcTm.tm_year && localTm.tm_yday > utcTm.tm_yday))
+       diff += 24 * 3600;
+     else
+       diff -= 24 * 3600;
+   }
+   return diff / 3600.0;
+ }
+
  // Fills prayerMin[6] in local wall-clock minutes. Requires a synced clock.
  static void prayerComputeForLocalDay(const struct tm& lt) {
    int y = lt.tm_year + 1900, m = lt.tm_mon + 1, day = lt.tm_mday;
@@ -1332,8 +1472,8 @@
    double B = 2 - A + floor(A / 4.0);
    double jd = floor(365.25 * (y + 4716)) + floor(30.6001 * (m + 1)) + day + B - 1524.5;
    jd = jd - ds.lon / (15.0 * 24.0);
- 
-   double tzHours = lt.tm_gmtoff / 3600.0;
+
+   double tzHours = localUtcOffsetHours();
  
    double fajrA = 18, ishaA = 17;
    bool ishaInterval = false;
@@ -1575,6 +1715,15 @@
    for (;;) {
      if (aiNetStep()) continue;
      helloStep();
+ 
+     lockSh();
+     bool wantDoc = sh.docWant && !sh.ai.open && !sh.active;
+     uint32_t docGen = sh.docGen;
+     unlockSh();
+     if (wantDoc) {
+       docFetchOnce(docGen);
+       continue;
+     }
  
      lockSh();
      uint32_t gen = sh.gen;
@@ -2393,12 +2542,276 @@
    drawFooter("<Back", mid, "1/2 Scroll");
  }
  
- void drawComingSoon(const char* title) {
+ // ---- content library UI (Huruf / Hadith / Q&A) ----
+ static int hurufIdx = 0;
+ static bool contentPlaying = false;
+ 
+ enum LibPhase : uint8_t { LP_LOAD = 0, LP_READY = 1, LP_EMPTY = 2, LP_ERR = 3 };
+ static LibPhase hadithPhase = LP_LOAD;
+ static int hadithCount = 0, hadithIdx = 0, hadithScroll = 0;
+ static uint16_t hadithNums[64];
+ static char hadithTitle[64], hadithSource[160];
+ static char hadithText[1504];
+ static int hadithLines = 0;
+ static char hadithLine[40][26];
+ 
+ enum QaMode : uint8_t { QA_TOPICS = 0, QA_ITEM = 1 };
+ static QaMode qaMode = QA_TOPICS;
+ static LibPhase qaPhase = LP_LOAD;
+ static int qaTopicCount = 0, qaTopicSel = 0, qaItemCount = 0, qaItemIdx = 0, qaScroll = 0;
+ static char qaTopicId[16][24];
+ static char qaTopicName[16][28];
+ static int qaTopicCounts[16];
+ static char qaQuestion[304], qaAnswer[1504], qaSource[160];
+ static int qaLines = 0;
+ static char qaLine[48][26];
+ 
+ static void wrapLines(const char* text, char lines[][26], int maxLines, int* outCount) {
+   *outCount = 0;
+   while (*text && *outCount < maxLines) {
+     int len = 0, cut = -1;
+     while (text[len] && text[len] != '\n' && len < 25) {
+       if (text[len] == ' ') cut = len;
+       len++;
+     }
+     if (len == 25 && text[len] && text[len] != ' ' && text[len] != '\n' && cut > 0) len = cut;
+     memcpy(lines[*outCount], text, len);
+     lines[*outCount][len] = 0;
+     (*outCount)++;
+     text += len;
+     while (*text == ' ') text++;
+     if (*text == '\n') text++;
+   }
+ }
+ 
+ static void startContentMp3(const char* rel) {
+   if (session) stopPlayback("Stopped");
+   lockSh();
+   snprintf(sh.contentPath, sizeof(sh.contentPath), "%s", rel);
+   unlockSh();
+   Clip c = { CONTENT_SURAH, 1, 0 };
+   playGen = playerStart(c, false);
+   session = true;
+   paused = false;
+   stepPending = false;
+   contentPlaying = true;
+   status = "Loading...";
+   dirty = true;
+ }
+ 
+ static void stopContentAudio() {
+   contentPlaying = false;
+   if (session) {
+     Status s = playerStatus();
+     if (s.clip.surah == CONTENT_SURAH) stopPlayback("Ready");
+   }
+ }
+ 
+ static void hurufOpen() {
+   hurufIdx = 0;
+   stopContentAudio();
+ }
+ 
+ static void hadithOpen() {
+   hadithPhase = LP_LOAD;
+   hadithCount = hadithIdx = hadithScroll = 0;
+   hadithTitle[0] = hadithText[0] = hadithSource[0] = 0;
+   hadithLines = 0;
+   stopContentAudio();
+   char path[72];
+   snprintf(path, sizeof(path), "hadith/index.json?v=%lu", (unsigned long)contentVerHadith);
+   docRequest(path);
+ }
+ 
+ static void hadithLoadItem() {
+   if (hadithCount <= 0) { hadithPhase = LP_EMPTY; return; }
+   if (hadithIdx < 0) hadithIdx = 0;
+   if (hadithIdx >= hadithCount) hadithIdx = hadithCount - 1;
+   hadithPhase = LP_LOAD;
+   hadithScroll = 0;
+   stopContentAudio();
+   char path[72];
+   uint16_t num = (hadithIdx >= 0 && hadithIdx < hadithCount) ? hadithNums[hadithIdx] : (uint16_t)(hadithIdx + 1);
+   snprintf(path, sizeof(path), "hadith/%03u.json?v=%lu", (unsigned)num, (unsigned long)contentVerHadith);
+   docRequest(path);
+ }
+ 
+ static void qaOpen() {
+   qaMode = QA_TOPICS;
+   qaPhase = LP_LOAD;
+   qaTopicCount = qaTopicSel = qaItemCount = qaItemIdx = qaScroll = 0;
+   stopContentAudio();
+   char path[72];
+   snprintf(path, sizeof(path), "qa/index.json?v=%lu", (unsigned long)contentVerQa);
+   docRequest(path);
+ }
+ 
+ static void qaLoadItem() {
+   if (qaItemCount <= 0) { qaPhase = LP_EMPTY; return; }
+   if (qaItemIdx < 0) qaItemIdx = 0;
+   if (qaItemIdx >= qaItemCount) qaItemIdx = qaItemCount - 1;
+   qaPhase = LP_LOAD;
+   qaScroll = 0;
+   stopContentAudio();
+   char path[80];
+   snprintf(path, sizeof(path), "qa/%s/%03d.json?v=%lu",
+            qaTopicId[qaTopicSel], qaItemIdx + 1, (unsigned long)contentVerQa);
+   docRequest(path);
+ }
+ 
+ static void contentPollDocs() {
+   lockSh();
+   bool done = sh.docDone;
+   bool ok = sh.docOk;
+   uint8_t err = sh.docErr;
+   static char buf[3200];
+   if (done) memcpy(buf, sh.docBuf, sizeof(buf));
+   sh.docDone = false;
+   unlockSh();
+   if (!done) return;
+ 
+   if (screen == SCR_HADITH) {
+     if (!ok) {
+       hadithPhase = (err == DOC_WIFI) ? LP_ERR : (err == DOC_NOTFOUND ? LP_EMPTY : LP_ERR);
+       status = (err == DOC_WIFI) ? "No Wi-Fi" : (err == DOC_NOTFOUND) ? "Not found" : "Error";
+       dirty = true;
+       return;
+     }
+     if (strstr(buf, "\"count\"") && strstr(buf, "\"items\"")) {
+       hadithCount = jsonInt(buf, "\"count\"", 0);
+       contentVerHadith = (uint32_t)jsonInt(buf, "\"version\"", (int)contentVerHadith);
+       hadithCount = 0;
+       const char* p = buf;
+       while (hadithCount < 64 && (p = strstr(p, "\"number\"")) != nullptr) {
+         int num = jsonInt(p, "\"number\"", 0);
+         if (num > 0) hadithNums[hadithCount++] = (uint16_t)num;
+         p += 8;
+       }
+       if (hadithCount <= 0) { hadithPhase = LP_EMPTY; dirty = true; return; }
+       hadithIdx = 0;
+       hadithLoadItem();
+       dirty = true;
+       return;
+     }
+     jsonFind(buf, "title", hadithTitle, sizeof(hadithTitle));
+     jsonFind(buf, "text", hadithText, sizeof(hadithText));
+     jsonFind(buf, "source", hadithSource, sizeof(hadithSource));
+     wrapLines(hadithText, hadithLine, 40, &hadithLines);
+     hadithPhase = LP_READY;
+     dirty = true;
+     return;
+   }
+ 
+   if (screen == SCR_QA) {
+     if (!ok) {
+       qaPhase = (err == DOC_WIFI) ? LP_ERR : (err == DOC_NOTFOUND ? LP_EMPTY : LP_ERR);
+       status = (err == DOC_WIFI) ? "No Wi-Fi" : (err == DOC_NOTFOUND) ? "Not found" : "Error";
+       dirty = true;
+       return;
+     }
+     if (qaMode == QA_TOPICS && strstr(buf, "\"topics\"")) {
+       contentVerQa = (uint32_t)jsonInt(buf, "\"version\"", (int)contentVerQa);
+       qaTopicCount = 0;
+       const char* p = buf;
+       while (qaTopicCount < 16 && (p = strstr(p, "\"id\"")) != nullptr) {
+         char id[24], name[28];
+         if (!jsonFind(p, "id", id, sizeof(id))) { p += 4; continue; }
+         if (!jsonFind(p, "name", name, sizeof(name))) name[0] = 0;
+         qaTopicCounts[qaTopicCount] = jsonInt(p, "\"count\"", 0);
+         snprintf(qaTopicId[qaTopicCount], sizeof(qaTopicId[0]), "%s", id);
+         snprintf(qaTopicName[qaTopicCount], sizeof(qaTopicName[0]), "%s", name[0] ? name : id);
+         qaTopicCount++;
+         p += 4;
+       }
+       if (qaTopicCount <= 0) { qaPhase = LP_EMPTY; dirty = true; return; }
+       qaTopicSel = 0;
+       qaPhase = LP_READY;
+       dirty = true;
+       return;
+     }
+     jsonFind(buf, "question", qaQuestion, sizeof(qaQuestion));
+     jsonFind(buf, "answer", qaAnswer, sizeof(qaAnswer));
+     jsonFind(buf, "source", qaSource, sizeof(qaSource));
+     char combined[1808];
+     snprintf(combined, sizeof(combined), "Q: %s\n%s", qaQuestion, qaAnswer);
+     wrapLines(combined, qaLine, 48, &qaLines);
+     qaPhase = LP_READY;
+     dirty = true;
+   }
+ }
+ 
+ void drawHuruf() {
+   drawStatusBar();
+   if (hurufIdx < 0) hurufIdx = 0;
+   if (hurufIdx >= HURUF_COUNT) hurufIdx = HURUF_COUNT - 1;
+   int x = (128 - HURUF_W) / 2;
+   u8g2.drawXBM(x, 12, HURUF_W, HURUF_H, HURUF_BITS[hurufIdx]);
+   char mid[20];
+   snprintf(mid, sizeof(mid), "%02d %s", hurufIdx + 1, HURUF_NAMES[hurufIdx]);
+   drawFooter("1/2 Letter", mid, contentPlaying ? "OK Stop" : "OK Play");
+ }
+ 
+ void drawHadith() {
    drawStatusBar();
    u8g2.setFont(u8g2_font_6x10_tr);
-   txtC(20, title);
-   txtC(36, "Coming soon");
-   drawFooter("<Back", nullptr, "5 AI");
+   if (hadithPhase == LP_LOAD) { txtC(28, "Loading..."); drawFooter("<Back", nullptr, "5 AI"); return; }
+   if (hadithPhase == LP_EMPTY) { txtC(28, "Empty"); drawFooter("<Back", nullptr, "5 AI"); return; }
+   if (hadithPhase == LP_ERR) { txtC(28, status); drawFooter("<Back", nullptr, "5 AI"); return; }
+   char head[32];
+   snprintf(head, sizeof(head), "#%d %s", hadithIdx + 1, hadithTitle);
+   u8g2.setFont(u8g2_font_5x7_tr);
+   u8g2.drawStr(0, 12, head);
+   for (int i = 0; i < 3; i++) {
+     int li = hadithScroll + i;
+     if (li >= hadithLines) break;
+     u8g2.drawStr(0, 22 + i * 8, hadithLine[li]);
+   }
+   if (hadithSource[0]) {
+     char src[28];
+     snprintf(src, sizeof(src), "%.24s", hadithSource);
+     u8g2.drawStr(0, 46, src);
+   }
+   drawFooter("1/2 Scroll", contentPlaying ? "OK Stop" : "OK Play", "5 AI");
+ }
+ 
+ void drawQA() {
+   drawStatusBar();
+   u8g2.setFont(u8g2_font_6x10_tr);
+   if (qaPhase == LP_LOAD) { txtC(28, "Loading..."); drawFooter("<Back", nullptr, "5 AI"); return; }
+   if (qaPhase == LP_EMPTY) { txtC(28, "Empty"); drawFooter("<Back", nullptr, "5 AI"); return; }
+   if (qaPhase == LP_ERR) { txtC(28, status); drawFooter("<Back", nullptr, "5 AI"); return; }
+   if (qaMode == QA_TOPICS) {
+     if (qaTopicSel < 0) qaTopicSel = 0;
+     if (qaTopicSel >= qaTopicCount) qaTopicSel = qaTopicCount - 1;
+     int top = qaTopicSel - 1;
+     if (top < 0) top = 0;
+     if (top > qaTopicCount - 3) top = qaTopicCount - 3;
+     if (top < 0) top = 0;
+     for (int i = 0; i < 3; i++) {
+       int idx = top + i;
+       if (idx >= qaTopicCount) break;
+       int y = 14 + i * 12;
+       if (idx == qaTopicSel) u8g2.drawRFrame(0, y, 128, 11, 2);
+       u8g2.drawStr(4, y + 2, qaTopicName[idx]);
+     }
+     drawFooter("1/2 Topic", "OK Open", "5 AI");
+     return;
+   }
+   u8g2.setFont(u8g2_font_5x7_tr);
+   char head[28];
+   snprintf(head, sizeof(head), "%s %d/%d", qaTopicName[qaTopicSel], qaItemIdx + 1, qaItemCount);
+   u8g2.drawStr(0, 12, head);
+   for (int i = 0; i < 3; i++) {
+     int li = qaScroll + i;
+     if (li >= qaLines) break;
+     u8g2.drawStr(0, 22 + i * 8, qaLine[li]);
+   }
+   if (qaSource[0]) {
+     char src[28];
+     snprintf(src, sizeof(src), "%.24s", qaSource);
+     u8g2.drawStr(0, 46, src);
+   }
+   drawFooter("1/2 Scroll", contentPlaying ? "OK Stop" : "OK Play", "5 AI");
  }
  
  // ---------------- PLAYER ----------------
@@ -2621,9 +3034,9 @@
        case SCR_SETTINGS: drawSettings(); break;
        case SCR_AI:       drawAI();       break;
        case SCR_ADHAN:    drawAdhan();    break;
-       case SCR_HURUF:    drawComingSoon("Huruf");  break;
-       case SCR_HADITH:   drawComingSoon("Hadith"); break;
-       case SCR_QA:       drawComingSoon("Q&A");    break;
+       case SCR_HURUF:    drawHuruf();  break;
+       case SCR_HADITH:   drawHadith(); break;
+       case SCR_QA:       drawQA();     break;
      }
    }
    u8g2.sendBuffer();
@@ -2702,7 +3115,11 @@
  
  void goScreen(Screen s) {
    if (screen == SCR_AI && s != SCR_AI) { playerStop(); aiSetOpen(false); }
-   if (s == SCR_HOME && session) stopPlayback("Ready");   // Home = silence
+   if (screen != s && (screen == SCR_HURUF || screen == SCR_HADITH || screen == SCR_QA)) {
+     docCancel();
+     stopContentAudio();
+   }
+   if (s == SCR_HOME && session && !adhanAlert) stopPlayback("Ready");   // Home = silence
    if (s != screen) prevScreen = screen;
    screen = s;
    if (!session) status = "Ready";
@@ -2759,7 +3176,16 @@
      adhanDismiss();
      return;
    }
+   if (screen == SCR_QA && qaMode == QA_ITEM) {
+     stopContentAudio();
+     docCancel();
+     qaMode = QA_TOPICS;
+     qaPhase = LP_READY;
+     dirty = true;
+     return;
+   }
    if (session) stopPlayback("Stopped");
+   contentPlaying = false;
    switch (screen) {
      case SCR_HOME:   break;
      case SCR_AI:     closeAI(); break;
@@ -2955,10 +3381,12 @@
    if (s.state == PS_FINISHED) {
      session = false;
      paused = false;
+     if (s.clip.surah == CONTENT_SURAH) contentPlaying = false;
      msg = "Done";
    } else if (s.state == PS_ERROR) {
      session = false;
      paused = false;
+     if (s.clip.surah == CONTENT_SURAH) contentPlaying = false;
      if (s.clip.surah >= 1 && s.clip.surah <= 114) {
        surah = s.clip.surah;                 // OK retries from the ayah that failed
        ayah = s.clip.ayah;
@@ -3082,10 +3510,13 @@
            adhanScroll = 0;
            goScreen(SCR_ADHAN);
          } else if (homeSel == 3) {
+           hurufOpen();
            goScreen(SCR_HURUF);
          } else if (homeSel == 4) {
+           hadithOpen();
            goScreen(SCR_HADITH);
          } else if (homeSel == 5) {
+           qaOpen();
            goScreen(SCR_QA);
          } else {
            goScreen(SCR_SETTINGS);
@@ -3100,8 +3531,79 @@
        break;
  
      case SCR_HURUF:
+       if (k == KEY1 || k == KEY2) {
+         stopContentAudio();
+         hurufIdx = (hurufIdx + (k == KEY1 ? HURUF_COUNT - 1 : 1)) % HURUF_COUNT;
+         dirty = true;
+       } else if (k == KEY3) {
+         if (contentPlaying) stopContentAudio();
+         else {
+           char path[40];
+           snprintf(path, sizeof(path), "huruf/%02d.mp3", hurufIdx + 1);
+           startContentMp3(path);
+         }
+       }
+       break;
+ 
      case SCR_HADITH:
+       if (hadithPhase != LP_READY) break;
+       if (k == KEY3) {
+         if (contentPlaying) stopContentAudio();
+         else {
+           char path[48];
+           uint16_t num = hadithNums[hadithIdx];
+           snprintf(path, sizeof(path), "hadith/%03u.mp3?v=%lu",
+                    (unsigned)num, (unsigned long)contentVerHadith);
+           startContentMp3(path);
+         }
+       } else {
+         int maxScroll = hadithLines - 3;
+         if (maxScroll < 0) maxScroll = 0;
+         if (k == KEY1) {
+           if (hadithScroll > 0) hadithScroll--;
+           else if (hadithIdx > 0) { hadithIdx--; hadithLoadItem(); }
+         } else if (k == KEY2) {
+           if (hadithScroll < maxScroll) hadithScroll++;
+           else if (hadithIdx + 1 < hadithCount) { hadithIdx++; hadithLoadItem(); }
+         }
+         dirty = true;
+       }
+       break;
+ 
      case SCR_QA:
+       if (qaPhase == LP_LOAD || qaPhase == LP_ERR) break;
+       if (qaMode == QA_TOPICS) {
+         if (k == KEY1) qaTopicSel = (qaTopicSel + qaTopicCount - 1) % qaTopicCount;
+         if (k == KEY2) qaTopicSel = (qaTopicSel + 1) % qaTopicCount;
+         if (k == KEY3) {
+           qaItemCount = qaTopicCounts[qaTopicSel];
+           qaItemIdx = 0;
+           qaMode = QA_ITEM;
+           qaLoadItem();
+         }
+         dirty = true;
+       } else if (qaPhase == LP_READY) {
+         if (k == KEY3) {
+           if (contentPlaying) stopContentAudio();
+           else {
+             char path[64];
+             snprintf(path, sizeof(path), "qa/%s/%03d.mp3?v=%lu",
+                      qaTopicId[qaTopicSel], qaItemIdx + 1, (unsigned long)contentVerQa);
+             startContentMp3(path);
+           }
+         } else {
+           int maxScroll = qaLines - 3;
+           if (maxScroll < 0) maxScroll = 0;
+           if (k == KEY1) {
+             if (qaScroll > 0) qaScroll--;
+             else if (qaItemIdx > 0) { qaItemIdx--; qaLoadItem(); }
+           } else if (k == KEY2) {
+             if (qaScroll < maxScroll) qaScroll++;
+             else if (qaItemIdx + 1 < qaItemCount) { qaItemIdx++; qaLoadItem(); }
+           }
+           dirty = true;
+         }
+       }
        break;
  
      case SCR_PLAYER:
@@ -3265,6 +3767,7 @@
  
    applyCloudSettings();
    adhanTick();
+   contentPollDocs();
  
    if (bootPhase == BOOT_BISMILLAH && !session) finishBoot();
  

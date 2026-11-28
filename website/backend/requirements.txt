@@ -4,3 +4,4 @@ requests
 cryptography
 psycopg[binary]
 gunicorn
+openpyxl

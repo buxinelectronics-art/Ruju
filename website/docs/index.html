@@ -5,23 +5,29 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Admin Dashboard</title>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 560px; margin: auto; padding: 16px; }
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: auto; padding: 14px; }
   input, textarea, select, button { box-sizing: border-box; font: inherit; padding: 9px; margin: 4px 0; }
   input, textarea, select { width: 100%; }
   button { cursor: pointer; }
+  nav { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
   nav button.on { font-weight: bold; border-width: 3px; }
   .box { border: 1px solid #8888; border-radius: 8px; padding: 12px; margin: 12px 0; }
-  .box p { white-space: pre-wrap; overflow-wrap: anywhere; }
-  .row { display: flex; gap: 8px; flex-wrap: wrap; }
-  .row > * { flex: 1 1 120px; }
+  .box p, .msg { white-space: pre-wrap; overflow-wrap: anywhere; }
+  label.row { display: block; margin: 8px 0; }
+  label.row > span { display: block; font-size: 13px; color: #444; margin-bottom: 2px; }
   .checks label { display: inline-flex; align-items: center; gap: 6px; width: auto; margin-right: 10px; }
   .checks input { width: auto; margin: 0; }
-  small { color: #555; }
+  small, .hint { color: #555; font-size: 13px; }
+  .err { color: #a00; }
+  .ok { color: #060; }
+  h3 { margin: 8px 0 4px; font-size: 15px; }
+  audio { width: 100%; margin-top: 6px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  td, th { border: 1px solid #ccc; padding: 4px; vertical-align: top; }
 </style>
 </head>
 <body>
 <h2>Admin Dashboard</h2>
-
 <form id="login">
   <input id="password" type="password" placeholder="Admin password" required>
   <button>Log in</button>
@@ -29,12 +35,15 @@
 
 <div id="app" hidden>
   <nav>
-    <button id="tabDevices" class="on">Devices</button>
-    <button id="tabContent">Content</button>
-    <button id="tabApi">API &amp; Test</button>
+    <button type="button" data-tab="devices" class="on">Devices</button>
+    <button type="button" data-tab="adhan">Adhan</button>
+    <button type="button" data-tab="huruf">Huruf</button>
+    <button type="button" data-tab="hadith">Hadith</button>
+    <button type="button" data-tab="qa">Q&amp;A</button>
+    <button type="button" data-tab="api">API &amp; Test</button>
   </nav>
 
-  <section id="devices">
+  <section id="tab-devices">
     <form id="add" class="box">
       <input id="name" placeholder="Device name" required>
       <button>Add device</button>
@@ -43,62 +52,83 @@
     <div id="list"></div>
   </section>
 
-  <section id="content" hidden>
-    <div class="box">
-      <b>Adhan MP3</b>
-      <p id="adhanStatus">Loading…</p>
-      <label>adhan.mp3 (Dhuhr / Asr / Maghrib / Isha)
-        <input id="fileAdhan" type="file" accept="audio/mpeg,.mp3">
-      </label>
-      <button type="button" id="uploadAdhan">Upload adhan.mp3</button>
-      <label>fajr.mp3 (Fajr only)
-        <input id="fileFajr" type="file" accept="audio/mpeg,.mp3">
-      </label>
-      <button type="button" id="uploadFajr">Upload fajr.mp3</button>
-      <small>Files are saved to GitHub docs/adhan/ for Pages. Max 5 MB each.</small>
-    </div>
+  <section id="tab-adhan" hidden>
+    <div class="box" id="cardAdhan"></div>
+    <div class="box" id="cardFajr"></div>
   </section>
 
-  <section id="api" hidden>
+  <section id="tab-huruf" hidden>
+    <div class="box">
+      <b>Batch assign</b>
+      <input id="hurufBatch" type="file" accept="audio/mpeg,.mp3" multiple>
+      <p class="hint">Select up to 28 MP3s, then assign each to a letter below.</p>
+      <div id="hurufBatchList"></div>
+    </div>
+    <div id="hurufSlots"></div>
+  </section>
+
+  <section id="tab-hadith" hidden>
+    <div class="box">
+      <a id="hadithTpl" href="templates/hadith-template.xlsx">Download Hadith template</a>
+      <input id="hadithFile" type="file" accept=".xlsx">
+      <button type="button" id="hadithPreview">Check file</button>
+      <button type="button" id="hadithPublish" disabled>Publish</button>
+      <button type="button" id="hadithDelete">Delete live list</button>
+      <p id="hadithProg" class="hint"></p>
+      <div id="hadithPreviewOut"></div>
+    </div>
+    <div class="box"><b>Live list</b><div id="hadithLive"></div></div>
+  </section>
+
+  <section id="tab-qa" hidden>
+    <div class="box">
+      <a id="qaTpl" href="templates/qa-template.xlsx">Download Q&amp;A template</a>
+      <input id="qaFile" type="file" accept=".xlsx">
+      <button type="button" id="qaPreview">Check file</button>
+      <button type="button" id="qaPublish" disabled>Publish</button>
+      <button type="button" id="qaDelete">Delete live list</button>
+      <p id="qaProg" class="hint"></p>
+      <div id="qaPreviewOut"></div>
+    </div>
+    <div class="box"><b>Live list</b><div id="qaLive"></div></div>
+  </section>
+
+  <section id="tab-api" hidden>
     <form id="config" class="box">
       <b>OpenAI settings</b> <span id="keyState"></span>
       <input id="api_key" type="password" placeholder="OpenAI API key (leave empty to keep)" autocomplete="off">
-      <label>Chat model<input id="chat_model"></label>
-      <label>Speech-to-text model<input id="stt_model"></label>
-      <label>Text-to-speech model<input id="tts_model"></label>
-      <label>Voice<select id="voice">
-        <option>alloy</option><option>ash</option><option>coral</option><option>echo</option>
-        <option>nova</option><option>onyx</option><option>sage</option><option>shimmer</option>
-      </select></label>
-      <label>AI instructions<textarea id="instructions" rows="5"></textarea></label>
+      <label class="row"><span>Chat model</span><input id="chat_model"></label>
+      <label class="row"><span>Speech-to-text model</span><input id="stt_model"></label>
+      <label class="row"><span>Text-to-speech model</span><input id="tts_model"></label>
+      <label class="row"><span>Voice</span>
+        <select id="voice">
+          <option>alloy</option><option>ash</option><option>coral</option><option>echo</option>
+          <option>nova</option><option>onyx</option><option>sage</option><option>shimmer</option>
+        </select>
+      </label>
+      <label class="row"><span>AI instructions</span><textarea id="instructions" rows="5"></textarea></label>
       <button>Save</button>
     </form>
     <div class="box">
       <b>Test</b>
       <input id="text" value="Hi" maxlength="300">
-      <button id="send">Send to AI</button>
-      <button id="speak">Speak (test voice)</button>
+      <button type="button" id="send">Send to AI</button>
+      <button type="button" id="speak">Speak</button>
       <p id="reply"></p>
       <audio id="player" controls hidden></audio>
     </div>
   </section>
 </div>
-<p id="msg"></p>
+<p id="msg" class="msg"></p>
 
 <script>
-// Change this to your Render address (no slash at the end). Never put the API key in this file.
 const API = "https://ruju-zxb0.onrender.com";
 const $ = id => document.getElementById(id);
 const FIELDS = ["chat_model", "stt_model", "tts_model", "voice", "instructions"];
-const DEVICE_FIELDS = [
-  "content_url", "timezone", "latitude", "longitude", "method", "asr", "high_lat",
-  "adj_fajr", "adj_sunrise", "adj_dhuhr", "adj_asr", "adj_maghrib", "adj_isha",
-  "volume", "reciter"
-];
-const PRAYER_FIELDS = ["prayer_fajr", "prayer_dhuhr", "prayer_asr", "prayer_maghrib", "prayer_isha"];
 let password = "";
-let meta = { methods: ["MWL", "ISNA", "Egypt", "UmmAlQura", "Karachi"],
-             asr_options: ["Shafi", "Hanafi"], high_lat: ["None", "MidNight", "OneSeventh", "AngleBased"] };
+let meta = { methods: [], asr_options: [], high_lat: [] };
+let hadithRows = null, qaRows = null;
+let hurufBatchFiles = [];
 
 async function call(path, method = "GET", body) {
   const r = await fetch(API + "/api/admin" + path, {
@@ -110,164 +140,119 @@ async function call(path, method = "GET", body) {
   const ct = r.headers.get("Content-Type") || "";
   return ct.startsWith("audio") ? r.blob() : r.json();
 }
-
-async function upload(path, formData) {
+async function upload(path, fd) {
   const r = await fetch(API + "/api/admin" + path, {
     method: "POST",
     headers: { "X-Admin-Password": password },
-    body: formData
+    body: fd
   });
   if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || "Upload failed");
   return r.json();
 }
-
 async function run(action) {
   $("msg").textContent = "Please wait...";
+  $("msg").className = "msg";
   try { await action(); $("msg").textContent = ""; }
-  catch (e) { $("msg").textContent = e.message; }
+  catch (e) { $("msg").textContent = e.message; $("msg").className = "msg err"; }
 }
-
+function setMsg(text, ok) {
+  $("msg").textContent = text;
+  $("msg").className = "msg " + (ok ? "ok" : "err");
+}
+function el(tag, props = {}, kids = []) {
+  const n = document.createElement(tag);
+  Object.entries(props).forEach(([k, v]) => {
+    if (k === "text") n.textContent = v;
+    else if (k === "html") n.innerHTML = v; // never for user data
+    else if (k.startsWith("on") && typeof v === "function") n[k] = v;
+    else n.setAttribute(k, v);
+  });
+  kids.forEach(c => n.appendChild(typeof c === "string" ? document.createTextNode(c) : c));
+  return n;
+}
+function labeled(span, node) {
+  const lab = el("label", { class: "row" });
+  lab.append(el("span", { text: span }), node);
+  return lab;
+}
 function fillSelect(sel, options, value) {
   sel.replaceChildren();
   options.forEach(opt => {
-    const o = document.createElement("option");
-    o.value = opt;
-    o.textContent = opt;
+    const o = el("option", { value: opt, text: opt });
     if (opt === value) o.selected = true;
     sel.appendChild(o);
   });
 }
 
 function deviceCard(device) {
-  const box = document.createElement("div");
-  box.className = "box";
+  const box = el("div", { class: "box" });
+  box.appendChild(el("p", { text: `${device.name}\n${device.id} — ${device.online ? "online" : "offline"} (cfg v${device.config_version})` }));
+  const form = el("form");
+  const mkNum = (name, val, step) => { const i = el("input", { name, type: "number", step: step || "1" }); i.value = val; return i; };
+  const mkText = (name, val) => { const i = el("input", { name, type: "text" }); i.value = val; return i; };
+  const mkSel = (name, opts, val) => { const s = el("select", { name }); fillSelect(s, opts, val); return s; };
 
-  const head = document.createElement("p");
-  head.textContent = `${device.name}\n${device.id} - ${device.online ? "online" : "offline"}  (cfg v${device.config_version})`;
-  box.appendChild(head);
+  form.append(el("h3", { text: "Location" }));
+  form.append(labeled("Content URL", mkText("content_url", device.content_url)));
+  form.append(labeled("Timezone (POSIX)", mkText("timezone", device.timezone)));
+  form.append(el("p", { class: "hint", text: "Examples: GMT0, GMT-3, WAT-1" }));
+  form.append(labeled("Latitude", mkNum("latitude", device.latitude, "any")));
+  form.append(labeled("Longitude", mkNum("longitude", device.longitude, "any")));
 
-  const form = document.createElement("form");
-  const fields = document.createElement("div");
+  form.append(el("h3", { text: "Prayer method" }));
+  form.append(labeled("Method", mkSel("method", meta.methods, device.method)));
+  form.append(labeled("Asr", mkSel("asr", meta.asr_options, device.asr)));
+  form.append(labeled("High latitude", mkSel("high_lat", meta.high_lat, device.high_lat)));
 
-  function labeled(labelText, el) {
-    const lab = document.createElement("label");
-    lab.textContent = labelText;
-    lab.appendChild(el);
-    return lab;
-  }
-  function num(name, value, step) {
-    const i = document.createElement("input");
-    i.name = name; i.type = "number"; i.value = value; i.step = step || "1";
-    return i;
-  }
-  function text(name, value) {
-    const i = document.createElement("input");
-    i.name = name; i.type = "text"; i.value = value;
-    return i;
-  }
-  function sel(name, options, value) {
-    const s = document.createElement("select");
-    s.name = name;
-    fillSelect(s, options, value);
-    return s;
-  }
-
-  fields.append(
-    labeled("Content URL", text("content_url", device.content_url)),
-    labeled("Timezone (POSIX)", text("timezone", device.timezone)),
-    (() => { const tip = document.createElement("small"); tip.textContent = "Examples: GMT0, GMT-3, WAT-1, PST8PDT,M3.2.0,M11.1.0"; return tip; })()
-  );
-
-  const geo = document.createElement("div");
-  geo.className = "row";
-  geo.append(labeled("Latitude", num("latitude", device.latitude, "any")),
-             labeled("Longitude", num("longitude", device.longitude, "any")));
-  fields.appendChild(geo);
-
-  fields.append(
-    labeled("Method", sel("method", meta.methods, device.method)),
-    labeled("Asr", sel("asr", meta.asr_options, device.asr)),
-    labeled("High latitude", sel("high_lat", meta.high_lat, device.high_lat))
-  );
-
-  const adj = document.createElement("div");
-  adj.className = "row";
+  form.append(el("h3", { text: "Adjustments (minutes)" }));
   [["adj_fajr","Fajr"],["adj_sunrise","Sunrise"],["adj_dhuhr","Dhuhr"],
    ["adj_asr","Asr"],["adj_maghrib","Maghrib"],["adj_isha","Isha"]].forEach(([k, lab]) => {
-    adj.appendChild(labeled(lab + " adj", num(k, device[k])));
+    form.append(labeled(lab, mkNum(k, device[k])));
   });
-  fields.appendChild(adj);
 
-  const checks = document.createElement("div");
-  checks.className = "checks";
-  checks.appendChild(document.createTextNode("Adhan on: "));
+  form.append(el("h3", { text: "Adhan on/off" }));
+  const checks = el("div", { class: "checks" });
   [["prayer_fajr","Fajr"],["prayer_dhuhr","Dhuhr"],["prayer_asr","Asr"],
    ["prayer_maghrib","Maghrib"],["prayer_isha","Isha"]].forEach(([k, lab]) => {
-    const labEl = document.createElement("label");
-    const c = document.createElement("input");
-    c.type = "checkbox"; c.name = k; c.checked = !!device[k];
-    labEl.append(c, document.createTextNode(lab));
-    checks.appendChild(labEl);
+    const L = el("label");
+    const c = el("input", { type: "checkbox", name: k });
+    c.checked = !!device[k];
+    L.append(c, document.createTextNode(lab));
+    checks.appendChild(L);
   });
-  fields.appendChild(checks);
+  form.append(checks);
 
-  const remote = document.createElement("div");
-  remote.className = "row";
-  remote.append(
-    labeled("Volume (-1 keep)", num("volume", device.volume)),
-    labeled("Reciter (-1 keep)", num("reciter", device.reciter))
-  );
-  fields.appendChild(remote);
+  form.append(el("h3", { text: "Player" }));
+  form.append(labeled("Volume (-1 keep)", mkNum("volume", device.volume)));
+  form.append(labeled("Reciter (-1 keep)", mkNum("reciter", device.reciter)));
 
-  const saveBtn = document.createElement("button");
-  saveBtn.textContent = "Save device settings";
-  form.append(fields, saveBtn);
+  const save = el("button", { text: "Save device settings" });
+  form.append(save);
   form.onsubmit = e => {
     e.preventDefault();
     const fd = new FormData(form);
     const body = {};
-    DEVICE_FIELDS.forEach(k => body[k] = fd.get(k));
-    PRAYER_FIELDS.forEach(k => body[k] = form.elements[k].checked);
-    body.latitude = Number(body.latitude);
-    body.longitude = Number(body.longitude);
-    ["volume", "reciter", ...DEVICE_FIELDS.filter(k => k.startsWith("adj_"))].forEach(k => {
-      body[k] = Number(body[k]);
-    });
+    ["content_url","timezone","method","asr","high_lat"].forEach(k => body[k] = fd.get(k));
+    ["latitude","longitude","volume","reciter","adj_fajr","adj_sunrise","adj_dhuhr","adj_asr","adj_maghrib","adj_isha"]
+      .forEach(k => body[k] = Number(fd.get(k)));
+    ["prayer_fajr","prayer_dhuhr","prayer_asr","prayer_maghrib","prayer_isha"]
+      .forEach(k => body[k] = form.elements[k].checked);
     run(async () => {
       await call("/devices/" + device.id + "/settings", "POST", body);
-      await load();
+      setMsg("Device settings saved.", true);
+      await loadDevices();
     });
   };
   box.appendChild(form);
-
-  const remove = document.createElement("button");
-  remove.type = "button";
-  remove.textContent = "Remove";
+  const remove = el("button", { type: "button", text: "Remove" });
   remove.onclick = () => confirm("Remove this device?") && run(async () => {
-    await call("/devices/" + device.id, "DELETE"); await load();
+    await call("/devices/" + device.id, "DELETE"); await loadDevices();
   });
   box.appendChild(remove);
   return box;
 }
 
-async function loadAdhanStatus() {
-  const el = $("adhanStatus");
-  el.textContent = "Checking GitHub…";
-  try {
-    const d = await call("/content/adhan");
-    const lines = [];
-    ["adhan.mp3", "fajr.mp3"].forEach(name => {
-      const f = d.files[name];
-      lines.push(f ? `${name}: ${f.size} bytes (sha ${f.sha})` : `${name}: not uploaded yet`);
-    });
-    lines.push(`Repo ${d.repo} @ ${d.branch}`);
-    el.textContent = lines.join("\n");
-  } catch (e) {
-    el.textContent = e.message;
-  }
-}
-
-async function load() {
+async function loadDevices() {
   const d = await call("");
   meta.methods = d.methods || meta.methods;
   meta.asr_options = d.asr_options || meta.asr_options;
@@ -275,64 +260,241 @@ async function load() {
   $("keyState").textContent = d.has_key ? "(key saved)" : "(no key yet)";
   FIELDS.forEach(f => $(f).value = d.settings[f]);
   $("list").replaceChildren(...d.devices.map(deviceCard));
-  loadAdhanStatus();
 }
+
+function mp3Card(title, fileKey, statusObj, onUpload) {
+  const box = el("div");
+  box.appendChild(el("b", { text: title }));
+  const st = el("p", { class: "hint" });
+  if (statusObj) st.textContent = `${fileKey}: ${statusObj.size} bytes (sha ${statusObj.sha})`;
+  else st.textContent = `${fileKey}: not uploaded yet`;
+  box.appendChild(st);
+  if (statusObj && statusObj.url) {
+    const a = el("audio", { controls: "controls", preload: "none" });
+    a.src = statusObj.url;
+    box.appendChild(a);
+  }
+  const input = el("input", { type: "file", accept: "audio/mpeg,.mp3" });
+  const btn = el("button", { type: "button", text: "Upload / replace" });
+  btn.onclick = () => run(async () => {
+    if (!input.files[0]) throw new Error("Choose an MP3 first");
+    await onUpload(input.files[0]);
+    input.value = "";
+    setMsg(fileKey + " uploaded.", true);
+    await loadAdhan();
+  });
+  box.append(input, btn);
+  return box;
+}
+
+async function loadAdhan() {
+  const d = await call("/content/adhan");
+  $("cardAdhan").replaceChildren();
+  $("cardFajr").replaceChildren();
+  $("cardAdhan").appendChild(mp3Card("Normal Adhan", "adhan.mp3", d.files["adhan.mp3"], async file => {
+    const fd = new FormData(); fd.append("kind", "adhan"); fd.append("file", file, file.name);
+    await upload("/content/adhan", fd);
+  }));
+  $("cardFajr").appendChild(mp3Card("Fajr Adhan", "fajr.mp3", d.files["fajr.mp3"], async file => {
+    const fd = new FormData(); fd.append("kind", "fajr"); fd.append("file", file, file.name);
+    await upload("/content/adhan", fd);
+  }));
+}
+
+async function loadHuruf() {
+  const d = await call("/content/huruf");
+  const root = $("hurufSlots");
+  root.replaceChildren();
+  d.slots.forEach(slot => {
+    const box = el("div", { class: "box" });
+    box.appendChild(el("b", { text: `${String(slot.n).padStart(2, "0")} — ${slot.name}` }));
+    box.appendChild(el("p", { class: "hint", text: slot.present ? `Uploaded (${slot.size} bytes)` : "Not uploaded" }));
+    if (slot.url) {
+      const a = el("audio", { controls: "controls", preload: "none" });
+      a.src = slot.url;
+      box.appendChild(a);
+    }
+    const input = el("input", { type: "file", accept: "audio/mpeg,.mp3" });
+    const btn = el("button", { type: "button", text: "Upload / replace" });
+    btn.onclick = () => run(async () => {
+      if (!input.files[0]) throw new Error("Choose an MP3");
+      const fd = new FormData();
+      fd.append("n", String(slot.n));
+      fd.append("file", input.files[0], input.files[0].name);
+      await upload("/content/huruf", fd);
+      setMsg(`Huruf ${slot.n} uploaded.`, true);
+      await loadHuruf();
+    });
+    if (hurufBatchFiles.length) {
+      const assign = el("select");
+      assign.appendChild(el("option", { value: "", text: "Assign batch file…" }));
+      hurufBatchFiles.forEach((f, i) => assign.appendChild(el("option", { value: String(i), text: f.name })));
+      assign.onchange = () => {
+        if (assign.value === "") return;
+        input.files = null;
+        // cannot set input.files; upload directly from batch
+        const file = hurufBatchFiles[Number(assign.value)];
+        run(async () => {
+          const fd = new FormData();
+          fd.append("n", String(slot.n));
+          fd.append("file", file, file.name);
+          await upload("/content/huruf", fd);
+          setMsg(`Huruf ${slot.n} ← ${file.name}`, true);
+          await loadHuruf();
+        });
+      };
+      box.appendChild(assign);
+    }
+    box.append(input, btn);
+    root.appendChild(box);
+  });
+}
+
+$("hurufBatch").onchange = () => {
+  hurufBatchFiles = Array.from($("hurufBatch").files || []).slice(0, 28);
+  const wrap = $("hurufBatchList");
+  wrap.replaceChildren();
+  hurufBatchFiles.forEach(f => wrap.appendChild(el("p", { class: "hint", text: f.name })));
+  loadHuruf();
+};
+
+function previewTable(rows, cols) {
+  const table = el("table");
+  const head = el("tr");
+  cols.forEach(c => head.appendChild(el("th", { text: c })));
+  table.appendChild(head);
+  rows.slice(0, 30).forEach(r => {
+    const tr = el("tr");
+    cols.forEach(c => tr.appendChild(el("td", { text: String(r[c] ?? "") })));
+    table.appendChild(tr);
+  });
+  if (rows.length > 30) table.appendChild(el("caption", { text: `Showing 30 of ${rows.length}` }));
+  return table;
+}
+
+async function pollJob(jid, progEl) {
+  for (;;) {
+    const j = await call("/jobs/" + jid);
+    progEl.textContent = `${j.status}: ${j.progress}` + (j.error ? " — " + j.error : "");
+    if (j.status === "done") return j;
+    if (j.status === "error") throw new Error(j.error || "Publish failed");
+    await new Promise(r => setTimeout(r, 1500));
+  }
+}
+
+$("hadithPreview").onclick = () => run(async () => {
+  const f = $("hadithFile").files[0];
+  if (!f) throw new Error("Choose an .xlsx file");
+  const fd = new FormData(); fd.append("file", f, f.name);
+  const d = await upload("/hadith/preview", fd);
+  const out = $("hadithPreviewOut");
+  out.replaceChildren();
+  if (d.errors && d.errors.length) {
+    d.errors.forEach(e => out.appendChild(el("p", { class: "err", text: e })));
+    hadithRows = null; $("hadithPublish").disabled = true;
+  } else {
+    out.appendChild(el("p", { class: "ok", text: `OK — ${d.count} rows` }));
+    out.appendChild(previewTable(d.rows, ["number", "title", "text", "source"]));
+    hadithRows = d.rows; $("hadithPublish").disabled = false;
+  }
+});
+$("hadithPublish").onclick = () => run(async () => {
+  if (!hadithRows) throw new Error("Check the file first");
+  const r = await call("/hadith/publish", "POST", { rows: hadithRows });
+  await pollJob(r.job_id, $("hadithProg"));
+  setMsg("Hadith published.", true);
+  await loadHadithLive();
+});
+$("hadithDelete").onclick = () => confirm("Delete live Hadith list?") && run(async () => {
+  await call("/hadith", "DELETE");
+  setMsg("Hadith list cleared.", true);
+  await loadHadithLive();
+});
+async function loadHadithLive() {
+  const d = await call("/hadith");
+  const box = $("hadithLive");
+  box.replaceChildren();
+  const idx = d.index || {};
+  box.appendChild(el("p", { text: `version ${idx.version || 0}, count ${idx.count || 0}` }));
+  (idx.items || []).forEach(it => box.appendChild(el("p", { class: "hint", text: `${it.number}. ${it.title || ""}` })));
+}
+
+$("qaPreview").onclick = () => run(async () => {
+  const f = $("qaFile").files[0];
+  if (!f) throw new Error("Choose an .xlsx file");
+  const fd = new FormData(); fd.append("file", f, f.name);
+  const d = await upload("/qa/preview", fd);
+  const out = $("qaPreviewOut");
+  out.replaceChildren();
+  if (d.errors && d.errors.length) {
+    d.errors.forEach(e => out.appendChild(el("p", { class: "err", text: e })));
+    qaRows = null; $("qaPublish").disabled = true;
+  } else {
+    out.appendChild(el("p", { class: "ok", text: `OK — ${d.count} rows` }));
+    out.appendChild(previewTable(d.rows, ["topic", "question", "answer", "source"]));
+    qaRows = d.rows; $("qaPublish").disabled = false;
+  }
+});
+$("qaPublish").onclick = () => run(async () => {
+  if (!qaRows) throw new Error("Check the file first");
+  const r = await call("/qa/publish", "POST", { rows: qaRows });
+  await pollJob(r.job_id, $("qaProg"));
+  setMsg("Q&A published.", true);
+  await loadQaLive();
+});
+$("qaDelete").onclick = () => confirm("Delete live Q&A list?") && run(async () => {
+  await call("/qa", "DELETE");
+  setMsg("Q&A list cleared.", true);
+  await loadQaLive();
+});
+async function loadQaLive() {
+  const d = await call("/qa");
+  const box = $("qaLive");
+  box.replaceChildren();
+  const idx = d.index || {};
+  box.appendChild(el("p", { text: `version ${idx.version || 0}` }));
+  (idx.topics || []).forEach(t => box.appendChild(el("p", { class: "hint", text: `${t.name} (${t.id}) — ${t.count}` })));
+}
+
+function showTab(name) {
+  ["devices","adhan","huruf","hadith","qa","api"].forEach(t => {
+    $("tab-" + t).hidden = t !== name;
+  });
+  document.querySelectorAll("nav button").forEach(b => b.classList.toggle("on", b.dataset.tab === name));
+  if (name === "adhan") loadAdhan().catch(e => setMsg(e.message, false));
+  if (name === "huruf") loadHuruf().catch(e => setMsg(e.message, false));
+  if (name === "hadith") loadHadithLive().catch(e => setMsg(e.message, false));
+  if (name === "qa") loadQaLive().catch(e => setMsg(e.message, false));
+}
+document.querySelectorAll("nav button").forEach(b => b.onclick = () => showTab(b.dataset.tab));
 
 $("login").onsubmit = e => {
   e.preventDefault();
   password = $("password").value;
-  run(async () => { await load(); $("login").hidden = true; $("app").hidden = false; });
+  run(async () => {
+    await loadDevices();
+    $("login").hidden = true; $("app").hidden = false;
+  });
 };
-
-function tab(which) {
-  $("devices").hidden = which !== "devices";
-  $("content").hidden = which !== "content";
-  $("api").hidden = which !== "api";
-  $("tabDevices").className = which === "devices" ? "on" : "";
-  $("tabContent").className = which === "content" ? "on" : "";
-  $("tabApi").className = which === "api" ? "on" : "";
-  if (which === "content") loadAdhanStatus();
-}
-$("tabDevices").onclick = () => tab("devices");
-$("tabContent").onclick = () => tab("content");
-$("tabApi").onclick = () => tab("api");
-
-async function uploadAdhan(kind, inputId) {
-  const input = $(inputId);
-  if (!input.files || !input.files[0]) throw new Error("Choose an MP3 first");
-  const fd = new FormData();
-  fd.append("kind", kind);
-  fd.append("file", input.files[0], input.files[0].name);
-  await upload("/content/adhan", fd);
-  input.value = "";
-  await loadAdhanStatus();
-}
-$("uploadAdhan").onclick = () => run(() => uploadAdhan("adhan", "fileAdhan"));
-$("uploadFajr").onclick = () => run(() => uploadAdhan("fajr", "fileFajr"));
-
 $("add").onsubmit = e => {
   e.preventDefault();
   run(async () => {
     const d = await call("/devices", "POST", { name: $("name").value });
-    $("newDevice").textContent = "Copy into the Arduino code now (the token is shown only once):\n\n" +
-      `#define PRODUCT_ID   "${d.product_id}"\n#define DEVICE_TOKEN "${d.token}"`;
+    $("newDevice").textContent =
+      `Copy into Arduino now (token shown once):\n\n#define PRODUCT_ID   "${d.product_id}"\n#define DEVICE_TOKEN "${d.token}"`;
     $("name").value = "";
-    await load();
+    await loadDevices();
   });
 };
-
 $("config").onsubmit = e => {
   e.preventDefault();
   const body = { api_key: $("api_key").value };
   FIELDS.forEach(f => body[f] = $(f).value);
-  run(async () => { await call("/config", "POST", body); $("api_key").value = ""; await load(); });
+  run(async () => { await call("/config", "POST", body); $("api_key").value = ""; setMsg("API settings saved.", true); await loadDevices(); });
 };
-
 $("send").onclick = () => run(async () => {
-  $("reply").textContent = "";
   $("reply").textContent = (await call("/test", "POST", { text: $("text").value })).answer;
 });
-
 $("speak").onclick = () => run(async () => {
   const sound = await call("/speak", "POST", { text: $("reply").textContent || $("text").value });
   const p = $("player");
@@ -340,7 +502,6 @@ $("speak").onclick = () => run(async () => {
   p.hidden = false;
   await p.play().catch(() => {});
 });
-$("text").oninput = () => $("reply").textContent = "";
 </script>
 </body>
 </html>

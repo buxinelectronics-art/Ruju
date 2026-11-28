@@ -14,11 +14,11 @@ DEFAULT_CONTENT_URL = os.getenv(
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "buxinelectronics-art/Ruju")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
-GITHUB_ALLOWED = ("docs/adhan/", "docs/huruf/", "docs/hadith/", "docs/qa/")
+GITHUB_ALLOWED = ("website/docs/adhan/", "website/docs/huruf/", "website/docs/hadith/", "website/docs/qa/")
 fernet = Fernet(base64.urlsafe_b64encode(hashlib.sha256(SECRET_KEY.encode()).digest()))
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 6 * 1024 * 1024   # Adhan MP3 uploads
+app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024   # MP3 / xlsx uploads
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
 app.json.ensure_ascii = False
 CORS(app, resources={r"/api/admin.*": {"origins": os.getenv("FRONTEND_ORIGIN", "*").rstrip("/")}})
@@ -396,83 +396,38 @@ def test_speak():
     return Response(tts(text), mimetype="audio/mpeg") if text else error("Type something", 400)
 
 # ---------- GitHub Pages content (docs/ only) ----------
-def github_configured():
-    return bool(GITHUB_TOKEN and GITHUB_REPO and GITHUB_BRANCH)
+import github_ops as gh
 
-def github_headers():
-    if not GITHUB_TOKEN:
-        raise RuntimeError("GITHUB_TOKEN not set on server")
-    return {
-        "Authorization": "Bearer " + GITHUB_TOKEN,
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
+publish_jobs = {}
+publish_lock = threading.Lock()
 
-def github_assert_path(path):
-    path = path.replace("\\", "/").lstrip("/")
-    if ".." in path.split("/") or not path.startswith(GITHUB_ALLOWED):
-        raise ValueError("path not allowed")
-    return path
-
-def github_get_file(path):
-    path = github_assert_path(path)
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
-    r = requests.get(url, headers=github_headers(), params={"ref": GITHUB_BRANCH}, timeout=40)
-    if r.status_code == 404:
-        return None
-    if not r.ok:
-        raise RuntimeError(f"GitHub read failed ({r.status_code})")
-    return r.json()
-
-def github_put_file(path, data_bytes, message):
-    path = github_assert_path(path)
-    if not isinstance(data_bytes, (bytes, bytearray)) or not data_bytes:
-        raise ValueError("empty file")
-    existing = github_get_file(path)
-    payload = {
-        "message": message,
-        "content": base64.b64encode(data_bytes).decode("ascii"),
-        "branch": GITHUB_BRANCH,
-    }
-    if existing and existing.get("sha"):
-        payload["sha"] = existing["sha"]
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
-    r = requests.put(url, headers=github_headers(), json=payload, timeout=60)
-    if not r.ok:
-        raise RuntimeError(f"GitHub write failed ({r.status_code}): {r.text[:200]}")
-    return r.json()
-
-def looks_like_mp3(data):
-    if len(data) < 4:
-        return False
-    if data[:3] == b"ID3":
-        return True
-    # MPEG frame sync
-    return data[0] == 0xFF and (data[1] & 0xE0) == 0xE0
+def need_github():
+    if not gh.configured():
+        return error("Set GITHUB_TOKEN, GITHUB_REPO and GITHUB_BRANCH on Render", 503)
+    return None
 
 @app.get("/api/admin/content/adhan")
 def adhan_status():
-    if not github_configured():
-        return error("Set GITHUB_TOKEN, GITHUB_REPO and GITHUB_BRANCH on Render", 503)
+    if (e := need_github()):
+        return e
     out = {}
     for name in ("adhan.mp3", "fajr.mp3"):
-        path = "docs/adhan/" + name
+        path = "website/docs/adhan/" + name
         try:
-            info = github_get_file(path)
-        except Exception as e:
-            return error(str(e), 502)
+            info = gh.get_file(path)
+        except Exception as ex:
+            return error(str(ex), 502)
         out[name] = None if not info else {
-            "path": path,
-            "size": info.get("size", 0),
-            "sha": info.get("sha", "")[:12],
+            "path": path, "size": info.get("size", 0),
+            "sha": (info.get("sha") or "")[:12],
             "url": info.get("download_url") or info.get("html_url"),
         }
     return jsonify(files=out, repo=GITHUB_REPO, branch=GITHUB_BRANCH)
 
 @app.post("/api/admin/content/adhan")
 def adhan_upload():
-    if not github_configured():
-        return error("Set GITHUB_TOKEN, GITHUB_REPO and GITHUB_BRANCH on Render", 503)
+    if (e := need_github()):
+        return e
     kind = str(request.form.get("kind", "")).strip().lower()
     if kind not in ("adhan", "fajr"):
         return error("kind must be adhan or fajr", 400)
@@ -484,17 +439,298 @@ def adhan_upload():
         return error("File is too small", 400)
     if len(raw) > 5 * 1024 * 1024:
         return error("File is too large (max 5 MB)", 400)
-    if not looks_like_mp3(raw):
+    if not gh.looks_like_mp3(raw):
         return error("File does not look like an MP3", 400)
-    name = kind + ".mp3"
-    path = "docs/adhan/" + name
+    path = "website/docs/adhan/" + kind + ".mp3"
     try:
-        github_put_file(path, raw, f"Update {path}")
-    except ValueError as e:
-        return error(str(e), 400)
-    except Exception as e:
-        return error(str(e), 502)
+        gh.put_file(path, raw, f"Update {path}")
+    except Exception as ex:
+        return error(str(ex), 502)
     return jsonify(ok=True, path=path, size=len(raw))
+
+@app.get("/api/admin/content/huruf")
+def huruf_status():
+    if (e := need_github()):
+        return e
+    slots = []
+    for i, name in enumerate(gh.HURUF_NAMES, start=1):
+        path = f"website/docs/huruf/{i:02d}.mp3"
+        try:
+            info = gh.get_file(path)
+        except Exception as ex:
+            return error(str(ex), 502)
+        slots.append({
+            "n": i, "name": name, "path": path,
+            "present": bool(info),
+            "size": (info or {}).get("size", 0),
+            "sha": ((info or {}).get("sha") or "")[:12],
+            "url": (info or {}).get("download_url"),
+        })
+    return jsonify(slots=slots)
+
+@app.post("/api/admin/content/huruf")
+def huruf_upload():
+    if (e := need_github()):
+        return e
+    try:
+        n = int(request.form.get("n", "0"))
+    except ValueError:
+        return error("n must be 1..28", 400)
+    if n < 1 or n > 28:
+        return error("n must be 1..28", 400)
+    f = request.files.get("file")
+    if not f:
+        return error("Choose an MP3 file", 400)
+    raw = f.read()
+    if len(raw) < 500 or len(raw) > 5 * 1024 * 1024:
+        return error("Bad file size", 400)
+    if not gh.looks_like_mp3(raw):
+        return error("File does not look like an MP3", 400)
+    path = f"website/docs/huruf/{n:02d}.mp3"
+    try:
+        gh.put_file(path, raw, f"Update {path}")
+    except Exception as ex:
+        return error(str(ex), 502)
+    return jsonify(ok=True, path=path, size=len(raw), name=gh.HURUF_NAMES[n - 1])
+
+def _job_new(kind):
+    jid = secrets.token_hex(8)
+    with publish_lock:
+        publish_jobs[jid] = {
+            "kind": kind, "status": "running", "progress": "starting",
+            "done": 0, "total": 0, "error": "", "ok": False,
+        }
+    return jid
+
+def _job_set(jid, **kw):
+    with publish_lock:
+        if jid in publish_jobs:
+            publish_jobs[jid].update(kw)
+
+@app.get("/api/admin/jobs/<jid>")
+def job_status(jid):
+    with publish_lock:
+        job = publish_jobs.get(jid)
+    if not job:
+        return error("Unknown job", 404)
+    return jsonify(job)
+
+@app.get("/api/admin/hadith")
+def hadith_list():
+    if (e := need_github()):
+        return e
+    try:
+        idx = gh.load_hadith_index()
+    except Exception as ex:
+        return error(str(ex), 502)
+    return jsonify(index=idx)
+
+@app.post("/api/admin/hadith/preview")
+def hadith_preview():
+    f = request.files.get("file")
+    if not f:
+        return error("Choose an .xlsx file", 400)
+    raw = f.read()
+    if len(raw) > 2 * 1024 * 1024:
+        return error("Excel file too large", 400)
+    rows, errors = gh.parse_hadith_xlsx(raw)
+    return jsonify(ok=not errors, rows=rows, errors=errors, count=len(rows))
+
+def _publish_hadith(jid, rows):
+    try:
+        _job_set(jid, progress="loading live index", total=len(rows))
+        old = gh.load_hadith_index()
+        old_map = {int(it.get("number")): it for it in old.get("items", []) if "number" in it}
+        files = {}
+        version = int(old.get("version") or 0) + 1
+        items_meta = []
+        for i, row in enumerate(rows):
+            num = int(row["number"])
+            stem = f"{num:03d}"
+            json_obj = {"number": num, "title": row["title"], "text": row["text"], "source": row["source"]}
+            json_bytes = json.dumps(json_obj, ensure_ascii=True, separators=(",", ":")).encode()
+            prev = old_map.get(num)
+            reuse = prev and prev.get("hash") == row["hash"]
+            mp3_path = f"website/docs/hadith/{stem}.mp3"
+            if reuse:
+                existing = gh.get_file_bytes(mp3_path)
+                if not existing:
+                    reuse = False
+            if reuse:
+                mp3 = existing
+                _job_set(jid, progress=f"reuse {i + 1}/{len(rows)}", done=i + 1)
+            else:
+                _job_set(jid, progress=f"TTS {i + 1}/{len(rows)}", done=i)
+                speak = row["title"] + ". " + row["text"]
+                if row.get("source"):
+                    speak += ". Source: " + row["source"]
+                for attempt in range(3):
+                    try:
+                        mp3 = tts(speak[:4000])
+                        break
+                    except Exception as ex:
+                        if attempt == 2:
+                            raise
+                        time.sleep(1 + attempt)
+                        _job_set(jid, progress=f"TTS retry {i + 1}/{len(rows)}")
+                _job_set(jid, progress=f"TTS done {i + 1}/{len(rows)}", done=i + 1)
+            files[f"website/docs/hadith/{stem}.json"] = json_bytes
+            files[mp3_path] = mp3
+            items_meta.append({"number": num, "title": row["title"], "hash": row["hash"], "file": stem})
+        index = {"version": version, "count": len(items_meta), "items": items_meta}
+        files["website/docs/hadith/index.json"] = json.dumps(index, ensure_ascii=True, indent=2).encode()
+        _job_set(jid, progress="committing to GitHub")
+        sha = gh.atomic_replace("website/docs/hadith/", files, f"Publish hadith v{version} ({len(rows)} items)")
+        _job_set(jid, status="done", ok=True, progress="done", done=len(rows), commit=sha, version=version)
+    except Exception as ex:
+        app.logger.exception("hadith publish failed")
+        _job_set(jid, status="error", error=str(ex), progress="failed")
+
+@app.post("/api/admin/hadith/publish")
+def hadith_publish():
+    if (e := need_github()):
+        return e
+    d = body()
+    rows = d.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return error("rows required", 400)
+    # re-validate lightly
+    if len(rows) > 500:
+        return error("Max 500 rows", 400)
+    jid = _job_new("hadith")
+    threading.Thread(target=_publish_hadith, args=(jid, rows), daemon=True).start()
+    return jsonify(job_id=jid)
+
+@app.delete("/api/admin/hadith")
+def hadith_delete():
+    if (e := need_github()):
+        return e
+    empty = {"version": int(time.time()), "count": 0, "items": []}
+    try:
+        sha = gh.atomic_replace(
+            "website/docs/hadith/",
+            {"website/docs/hadith/index.json": json.dumps(empty, indent=2).encode()},
+            "Clear hadith list",
+        )
+    except Exception as ex:
+        return error(str(ex), 502)
+    return jsonify(ok=True, commit=sha)
+
+@app.get("/api/admin/qa")
+def qa_list():
+    if (e := need_github()):
+        return e
+    try:
+        idx = gh.load_qa_index()
+    except Exception as ex:
+        return error(str(ex), 502)
+    return jsonify(index=idx)
+
+@app.post("/api/admin/qa/preview")
+def qa_preview():
+    f = request.files.get("file")
+    if not f:
+        return error("Choose an .xlsx file", 400)
+    raw = f.read()
+    if len(raw) > 2 * 1024 * 1024:
+        return error("Excel file too large", 400)
+    rows, errors = gh.parse_qa_xlsx(raw)
+    return jsonify(ok=not errors, rows=rows, errors=errors, count=len(rows))
+
+def _publish_qa(jid, rows):
+    try:
+        _job_set(jid, progress="loading live index", total=len(rows))
+        old = gh.load_qa_index()
+        old_hash = {}
+        for t in old.get("topics", []):
+            tid = t.get("id")
+            for n in range(1, int(t.get("count") or 0) + 1):
+                path = f"website/docs/qa/{tid}/{n:03d}.json"
+                raw = gh.get_file_bytes(path)
+                if not raw:
+                    continue
+                obj = json.loads(raw.decode())
+                h = gh.row_hash(tid, obj.get("question", ""), obj.get("answer", ""), obj.get("source", ""))
+                old_hash[(tid, n)] = h
+        # group by topic preserving order
+        topics_order = []
+        by_topic = {}
+        for row in rows:
+            tid = row["topic_id"]
+            if tid not in by_topic:
+                by_topic[tid] = []
+                topics_order.append((tid, row["topic"]))
+            by_topic[tid].append(row)
+        files = {}
+        version = int(old.get("version") or 0) + 1
+        topics_meta = []
+        done = 0
+        for tid, tname in topics_order:
+            items = by_topic[tid]
+            topics_meta.append({"id": tid, "name": tname, "count": len(items)})
+            for n, row in enumerate(items, start=1):
+                done += 1
+                json_obj = {"question": row["question"], "answer": row["answer"], "source": row["source"]}
+                json_bytes = json.dumps(json_obj, ensure_ascii=True, separators=(",", ":")).encode()
+                mp3_path = f"website/docs/qa/{tid}/{n:03d}.mp3"
+                reuse = old_hash.get((tid, n)) == row["hash"]
+                if reuse:
+                    existing = gh.get_file_bytes(mp3_path)
+                    if not existing:
+                        reuse = False
+                if reuse:
+                    mp3 = existing
+                    _job_set(jid, progress=f"reuse {done}/{len(rows)}", done=done)
+                else:
+                    _job_set(jid, progress=f"TTS {done}/{len(rows)}", done=done - 1)
+                    speak = row["question"].rstrip(".?") + "? ... " + row["answer"]
+                    for attempt in range(3):
+                        try:
+                            mp3 = tts(speak[:4000])
+                            break
+                        except Exception:
+                            if attempt == 2:
+                                raise
+                            time.sleep(1 + attempt)
+                    _job_set(jid, progress=f"TTS done {done}/{len(rows)}", done=done)
+                files[f"website/docs/qa/{tid}/{n:03d}.json"] = json_bytes
+                files[mp3_path] = mp3
+        index = {"version": version, "topics": topics_meta}
+        files["website/docs/qa/index.json"] = json.dumps(index, ensure_ascii=True, indent=2).encode()
+        _job_set(jid, progress="committing to GitHub")
+        sha = gh.atomic_replace("website/docs/qa/", files, f"Publish Q&A v{version} ({len(rows)} items)")
+        _job_set(jid, status="done", ok=True, progress="done", done=len(rows), commit=sha, version=version)
+    except Exception as ex:
+        app.logger.exception("qa publish failed")
+        _job_set(jid, status="error", error=str(ex), progress="failed")
+
+@app.post("/api/admin/qa/publish")
+def qa_publish():
+    if (e := need_github()):
+        return e
+    rows = body().get("rows")
+    if not isinstance(rows, list) or not rows:
+        return error("rows required", 400)
+    if len(rows) > 500:
+        return error("Max 500 rows", 400)
+    jid = _job_new("qa")
+    threading.Thread(target=_publish_qa, args=(jid, rows), daemon=True).start()
+    return jsonify(job_id=jid)
+
+@app.delete("/api/admin/qa")
+def qa_delete():
+    if (e := need_github()):
+        return e
+    empty = {"version": int(time.time()), "topics": []}
+    try:
+        sha = gh.atomic_replace(
+            "website/docs/qa/",
+            {"website/docs/qa/index.json": json.dumps(empty, indent=2).encode()},
+            "Clear Q&A list",
+        )
+    except Exception as ex:
+        return error(str(ex), 502)
+    return jsonify(ok=True, commit=sha)
 
 # ---------- ESP32 ----------
 def device_id():
