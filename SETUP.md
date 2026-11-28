@@ -3,7 +3,7 @@
 ## Render (Flask API)
 - Root Directory: `website/backend`
 - Build: `pip install -r requirements.txt`
-- Start: `gunicorn wsgi:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 120`
+- Start: `gunicorn wsgi:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120`
 - Env:
   - `ADMIN_PASSWORD`, `SECRET_KEY` (required)
   - `DATABASE_URL` (Neon, recommended)

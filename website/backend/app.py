@@ -1,4 +1,4 @@
-import base64, hashlib, hmac, json, os, secrets, threading, time
+import base64, hashlib, hmac, json, os, re, secrets, threading, time
 import requests
 from cryptography.fernet import Fernet
 from flask import Flask, Response, jsonify, request
@@ -14,11 +14,14 @@ DEFAULT_CONTENT_URL = os.getenv(
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_REPO = os.getenv("GITHUB_REPO", "buxinelectronics-art/Ruju")
 GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
-GITHUB_ALLOWED = ("website/docs/adhan/", "website/docs/huruf/", "website/docs/hadith/", "website/docs/qa/")
+GITHUB_ALLOWED = (
+    "website/docs/adhan/", "website/docs/huruf/", "website/docs/hadith/",
+    "website/docs/qa/", "website/docs/songs/",
+)
 fernet = Fernet(base64.urlsafe_b64encode(hashlib.sha256(SECRET_KEY.encode()).digest()))
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024   # MP3 / xlsx uploads
+app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024   # default; songs routes raise to 10 MB
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1)
 app.json.ensure_ascii = False
 CORS(app, resources={r"/api/admin.*": {"origins": os.getenv("FRONTEND_ORIGIN", "*").rstrip("/")}})
@@ -313,6 +316,11 @@ def home():
 # ---------- admin dashboard ----------
 @app.before_request
 def admin_login():
+    # Songs uploads may be up to 10 MB; keep other routes at 8 MB.
+    if request.path.startswith("/api/admin/songs"):
+        app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024 + 256 * 1024
+    else:
+        app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
     if request.path.startswith("/api/admin") and request.method != "OPTIONS":
         who = "login:" + str(request.remote_addr)
         if len([t for t in hits.get(who, []) if time.time() - t < 300]) >= 10:
@@ -320,6 +328,10 @@ def admin_login():
         if not hmac.compare_digest(request.headers.get("X-Admin-Password", "").encode(), ADMIN_PASSWORD.encode()):
             too_many(who, 10, 300)
             return error("Wrong password", 401)
+
+@app.errorhandler(413)
+def too_large(_e):
+    return error("File is too large for this route", 413)
 
 def body():
     d = request.get_json(silent=True)
@@ -731,6 +743,259 @@ def qa_delete():
     except Exception as ex:
         return error(str(ex), 502)
     return jsonify(ok=True, commit=sha)
+
+# ---------- Songs (Arabic Songs) ----------
+song_batches = {}
+
+def _songs_storage_payload(stats=None):
+    stats = stats or gh.website_docs_stats()
+    docs = int(stats["docs_bytes"])
+    return {
+        "docs_bytes": docs,
+        "docs_files": stats["docs_files"],
+        "songs_bytes": stats["songs_bytes"],
+        "warn_bytes": gh.DOCS_WARN_BYTES,
+        "block_bytes": gh.DOCS_BLOCK_BYTES,
+        "near_limit": docs >= gh.DOCS_WARN_BYTES,
+        "blocked": docs >= gh.DOCS_BLOCK_BYTES,
+    }
+
+@app.get("/api/admin/songs")
+def songs_list():
+    if (e := need_github()):
+        return e
+    try:
+        idx, songs = gh.load_songs_list()
+        stats = gh.website_docs_stats()
+        # per-file sizes from tree
+        sizes = {}
+        ref = gh.api("GET", f"git/ref/heads/{gh.GITHUB_BRANCH}")
+        if ref.ok:
+            commit = gh.api("GET", f"git/commits/{ref.json()['object']['sha']}")
+            if commit.ok:
+                tree = gh.api("GET", f"git/trees/{commit.json()['tree']['sha']}", params={"recursive": "1"})
+                if tree.ok:
+                    for item in tree.json().get("tree", []):
+                        path = item.get("path", "")
+                        if path.startswith(gh.SONGS_PREFIX) and path.endswith(".mp3"):
+                            sizes[path.rsplit("/", 1)[-1].removesuffix(".mp3")] = int(item.get("size") or 0)
+        for s in songs:
+            s["size"] = sizes.get(s["id"], 0)
+            s["url"] = f"{DEFAULT_CONTENT_URL}/songs/{s['id']}.mp3?v={idx.get('version') or 0}"
+    except Exception as ex:
+        return error(str(ex), 502)
+    return jsonify(index=idx, songs=songs, storage=_songs_storage_payload(stats),
+                   max_mb=10, max_kbps=gh.SONG_MP3_MAX_KBPS)
+
+@app.post("/api/admin/songs/batch/start")
+def songs_batch_start():
+    if (e := need_github()):
+        return e
+    try:
+        stats = gh.website_docs_stats()
+    except Exception as ex:
+        return error(str(ex), 502)
+    if stats["docs_bytes"] >= gh.DOCS_BLOCK_BYTES:
+        return error(
+            f"Storage full: website/docs is over {gh.DOCS_BLOCK_BYTES // (1024 * 1024)} MB. "
+            "Delete songs or other content before uploading.",
+            400,
+        )
+    bid = secrets.token_hex(8)
+    with publish_lock:
+        song_batches[bid] = {
+            "items": [], "status": "open", "created": time.time(),
+            "error": "", "warning": (
+                f"Warning: website/docs is over {gh.DOCS_WARN_BYTES // (1024 * 1024)} MB"
+                if stats["docs_bytes"] >= gh.DOCS_WARN_BYTES else ""
+            ),
+        }
+    return jsonify(batch_id=bid, storage=_songs_storage_payload(stats), warning=song_batches[bid]["warning"])
+
+@app.post("/api/admin/songs/batch/<bid>/file")
+def songs_batch_file(bid):
+    """Validate one MP3, strip ID3, create a Git blob (no branch change yet)."""
+    if (e := need_github()):
+        return e
+    with publish_lock:
+        batch = song_batches.get(bid)
+    if not batch or batch.get("status") != "open":
+        return error("Unknown or closed upload batch", 404)
+    title = str(request.form.get("title", "")).strip()
+    artist = str(request.form.get("artist", "")).strip()
+    if (err := gh.song_title_ok(title)):
+        return error(err, 400)
+    if (err := gh.song_artist_ok(artist)):
+        return error(err, 400)
+    f = request.files.get("file")
+    if not f:
+        return error("Choose an MP3 file", 400)
+    raw = f.read()
+    cleaned, errors = gh.validate_song_mp3(raw)
+    if errors:
+        return error(errors[0], 400)
+    try:
+        stats = gh.website_docs_stats()
+        pending = sum(it["size"] for it in batch["items"]) + len(cleaned)
+        if stats["docs_bytes"] + pending > gh.DOCS_BLOCK_BYTES:
+            return error(
+                f"Upload blocked: this file would push website/docs over "
+                f"{gh.DOCS_BLOCK_BYTES // (1024 * 1024)} MB",
+                400,
+            )
+        blob_sha = gh.create_blob(cleaned)
+    except Exception as ex:
+        return error(str(ex), 502)
+    item = {
+        "client_id": str(request.form.get("client_id", ""))[:40],
+        "title": title, "artist": artist, "sha": blob_sha, "size": len(cleaned),
+    }
+    with publish_lock:
+        batch = song_batches.get(bid)
+        if not batch or batch.get("status") != "open":
+            return error("Batch closed", 404)
+        batch["items"].append(item)
+        n = len(batch["items"])
+    return jsonify(ok=True, index=n - 1, size=len(cleaned), sha=blob_sha[:12],
+                   warning=("Warning: approaching storage limit"
+                            if stats["docs_bytes"] + pending >= gh.DOCS_WARN_BYTES else ""))
+
+@app.post("/api/admin/songs/batch/<bid>/commit")
+def songs_batch_commit(bid):
+    if (e := need_github()):
+        return e
+    with publish_lock:
+        batch = song_batches.get(bid)
+        if not batch or batch.get("status") != "open":
+            return error("Unknown or closed upload batch", 404)
+        items = list(batch["items"])
+        batch["status"] = "committing"
+    if not items:
+        with publish_lock:
+            if bid in song_batches:
+                song_batches[bid]["status"] = "open"
+        return error("No files in this batch", 400)
+    try:
+        idx, songs = gh.load_songs_list()
+        old_count = len(songs)
+        nid = gh.next_song_id(songs)
+        added = []
+        changes: dict = {}
+        for it in items:
+            sid = f"s{nid:04d}"
+            nid += 1
+            songs.append({"id": sid, "title": it["title"], "artist": it.get("artist") or ""})
+            changes[f"{gh.SONGS_PREFIX}{sid}.mp3"] = it["sha"]
+            added.append(sid)
+        version = int(idx.get("version") or 0) + 1
+        pages = gh.build_song_pages(songs)
+        changes.update(pages)
+        changes.update(gh.songs_page_deletes(old_count, len(songs)))
+        index = {"version": version, "count": len(songs), "pageSize": gh.SONGS_PAGE_SIZE}
+        changes[gh.SONGS_PREFIX + "index.json"] = json.dumps(index, ensure_ascii=True, separators=(",", ":")).encode()
+        sha = gh.atomic_update(changes, f"Add songs v{version} (+{len(added)})")
+        with publish_lock:
+            if bid in song_batches:
+                song_batches[bid]["status"] = "done"
+                song_batches[bid]["commit"] = sha
+        return jsonify(ok=True, commit=sha, version=version, count=len(songs), added=added)
+    except Exception as ex:
+        app.logger.exception("songs batch commit failed")
+        with publish_lock:
+            if bid in song_batches:
+                song_batches[bid]["status"] = "open"  # allow retry; live tree unchanged
+                song_batches[bid]["error"] = str(ex)
+        return error(str(ex), 502)
+
+@app.delete("/api/admin/songs/batch/<bid>")
+def songs_batch_cancel(bid):
+    with publish_lock:
+        song_batches.pop(bid, None)
+    return jsonify(ok=True)
+
+@app.patch("/api/admin/songs/<sid>")
+def songs_edit(sid):
+    if (e := need_github()):
+        return e
+    if not re.fullmatch(r"s\d{4}", sid):
+        return error("Bad song id", 400)
+    d = body()
+    title = str(d.get("title", "")).strip()
+    artist = str(d.get("artist", "")).strip()
+    if (err := gh.song_title_ok(title)):
+        return error(err, 400)
+    if (err := gh.song_artist_ok(artist)):
+        return error(err, 400)
+    try:
+        idx, songs = gh.load_songs_list()
+        found = False
+        for s in songs:
+            if s["id"] == sid:
+                s["title"], s["artist"] = title, artist
+                found = True
+                break
+        if not found:
+            return error("Song not found", 404)
+        version = int(idx.get("version") or 0) + 1
+        changes = gh.build_song_pages(songs)
+        changes[gh.SONGS_PREFIX + "index.json"] = json.dumps(
+            {"version": version, "count": len(songs), "pageSize": gh.SONGS_PAGE_SIZE},
+            ensure_ascii=True, separators=(",", ":"),
+        ).encode()
+        sha = gh.atomic_update(changes, f"Edit song {sid} v{version}")
+    except Exception as ex:
+        return error(str(ex), 502)
+    return jsonify(ok=True, commit=sha, version=version)
+
+@app.post("/api/admin/songs/reorder")
+def songs_reorder():
+    if (e := need_github()):
+        return e
+    order = body().get("ids")
+    if not isinstance(order, list) or not order:
+        return error("ids required", 400)
+    try:
+        idx, songs = gh.load_songs_list()
+        by_id = {s["id"]: s for s in songs}
+        if sorted(order) != sorted(by_id.keys()):
+            return error("ids must match the full song list", 400)
+        songs = [by_id[i] for i in order]
+        version = int(idx.get("version") or 0) + 1
+        changes = gh.build_song_pages(songs)
+        changes.update(gh.songs_page_deletes(len(by_id), len(songs)))
+        changes[gh.SONGS_PREFIX + "index.json"] = json.dumps(
+            {"version": version, "count": len(songs), "pageSize": gh.SONGS_PAGE_SIZE},
+            ensure_ascii=True, separators=(",", ":"),
+        ).encode()
+        sha = gh.atomic_update(changes, f"Reorder songs v{version}")
+    except Exception as ex:
+        return error(str(ex), 502)
+    return jsonify(ok=True, commit=sha, version=version)
+
+@app.delete("/api/admin/songs/<sid>")
+def songs_delete(sid):
+    if (e := need_github()):
+        return e
+    if not re.fullmatch(r"s\d{4}", sid):
+        return error("Bad song id", 400)
+    try:
+        idx, songs = gh.load_songs_list()
+        old_count = len(songs)
+        songs = [s for s in songs if s["id"] != sid]
+        if len(songs) == old_count:
+            return error("Song not found", 404)
+        version = int(idx.get("version") or 0) + 1
+        changes = gh.build_song_pages(songs)
+        changes.update(gh.songs_page_deletes(old_count, len(songs)))
+        changes[f"{gh.SONGS_PREFIX}{sid}.mp3"] = None
+        changes[gh.SONGS_PREFIX + "index.json"] = json.dumps(
+            {"version": version, "count": len(songs), "pageSize": gh.SONGS_PAGE_SIZE},
+            ensure_ascii=True, separators=(",", ":"),
+        ).encode()
+        sha = gh.atomic_update(changes, f"Delete song {sid} v{version}")
+    except Exception as ex:
+        return error(str(ex), 502)
+    return jsonify(ok=True, commit=sha, version=version, count=len(songs))
 
 # ---------- ESP32 ----------
 def device_id():

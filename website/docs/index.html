@@ -24,6 +24,11 @@
   audio { width: 100%; margin-top: 6px; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; }
   td, th { border: 1px solid #ccc; padding: 4px; vertical-align: top; }
+  .song-row { border: 1px solid #8888; border-radius: 8px; padding: 10px; margin: 8px 0; }
+  .song-row .actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .song-row .actions button { flex: 1 1 auto; min-width: 72px; }
+  .upload-row { border: 1px solid #ccc; border-radius: 8px; padding: 8px; margin: 8px 0; }
+  progress { width: 100%; height: 10px; }
 </style>
 </head>
 <body>
@@ -40,6 +45,7 @@
     <button type="button" data-tab="huruf">Huruf</button>
     <button type="button" data-tab="hadith">Hadith</button>
     <button type="button" data-tab="qa">Q&amp;A</button>
+    <button type="button" data-tab="songs">Songs</button>
     <button type="button" data-tab="api">API &amp; Test</button>
   </nav>
 
@@ -93,6 +99,23 @@
     <div class="box"><b>Live list</b><div id="qaLive"></div></div>
   </section>
 
+  <section id="tab-songs" hidden>
+    <div class="box">
+      <b>Upload Arabic Songs</b>
+      <p class="hint">MP3 only, max 10 MB and 128 kbps each. ID3 / cover art stripped on server.</p>
+      <input id="songsFiles" type="file" accept="audio/mpeg,.mp3" multiple>
+      <div id="songsUploadList"></div>
+      <button type="button" id="songsUploadBtn" disabled>Upload selected</button>
+      <p id="songsUploadProg" class="hint"></p>
+    </div>
+    <div class="box">
+      <b>Library</b>
+      <p id="songsStats" class="hint"></p>
+      <input id="songsSearch" type="search" placeholder="Search title or artist">
+      <div id="songsLive"></div>
+    </div>
+  </section>
+
   <section id="tab-api" hidden>
     <form id="config" class="box">
       <b>OpenAI settings</b> <span id="keyState"></span>
@@ -129,6 +152,8 @@ let password = "";
 let meta = { methods: [], asr_options: [], high_lat: [] };
 let hadithRows = null, qaRows = null;
 let hurufBatchFiles = [];
+let songsCache = [];
+let songsPending = []; // {file, title, artist, status, error, client_id}
 
 async function call(path, method = "GET", body) {
   const r = await fetch(API + "/api/admin" + path, {
@@ -456,8 +481,201 @@ async function loadQaLive() {
   (idx.topics || []).forEach(t => box.appendChild(el("p", { class: "hint", text: `${t.name} (${t.id}) — ${t.count}` })));
 }
 
+function fmtBytes(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + " B";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
+  return (n / (1024 * 1024)).toFixed(2) + " MB";
+}
+function suggestSongTitle(name) {
+  let t = String(name || "").replace(/\.[^.]+$/, "");
+  t = t.replace(/[_]+/g, " ").replace(/\s+/g, " ").trim();
+  t = t.replace(/[^A-Za-z0-9 .'\-,!?()]/g, "");
+  if (!/[A-Za-z]/.test(t)) t = "Song";
+  return t.slice(0, 60);
+}
+function renderSongsPending() {
+  const box = $("songsUploadList");
+  box.replaceChildren();
+  songsPending.forEach((row, i) => {
+    const wrap = el("div", { class: "upload-row" });
+    wrap.appendChild(el("p", { class: "hint", text: row.file.name + " (" + fmtBytes(row.file.size) + ")" }));
+    const title = el("input", { type: "text", maxlength: "60", placeholder: "Title (required)" });
+    title.value = row.title;
+    title.oninput = () => { row.title = title.value; };
+    const artist = el("input", { type: "text", maxlength: "40", placeholder: "Artist (optional)" });
+    artist.value = row.artist;
+    artist.oninput = () => { row.artist = artist.value; };
+    wrap.append(labeled("Title", title), labeled("Artist", artist));
+    const st = el("p", { class: "hint" });
+    st.textContent = row.status + (row.error ? " — " + row.error : "");
+    if (row.error) st.className = "hint err";
+    else if (row.status === "ok") st.className = "hint ok";
+    wrap.appendChild(st);
+    if (row.progress != null) {
+      const pr = el("progress", { max: "100", value: String(row.progress) });
+      wrap.appendChild(pr);
+    }
+    if (row.error) {
+      const retry = el("button", { type: "button", text: "Retry later" });
+      retry.onclick = () => { row.status = "ready"; row.error = ""; row.progress = null; renderSongsPending(); };
+      wrap.appendChild(retry);
+    }
+    const rm = el("button", { type: "button", text: "Remove" });
+    rm.onclick = () => { songsPending.splice(i, 1); renderSongsPending(); $("songsUploadBtn").disabled = !songsPending.length; };
+    wrap.appendChild(rm);
+    box.appendChild(wrap);
+  });
+  $("songsUploadBtn").disabled = !songsPending.length;
+}
+$("songsFiles").onchange = () => {
+  const files = Array.from($("songsFiles").files || []);
+  files.forEach(f => {
+    songsPending.push({
+      file: f, title: suggestSongTitle(f.name), artist: "",
+      status: "ready", error: "", client_id: "c" + Math.random().toString(16).slice(2),
+      progress: null
+    });
+  });
+  $("songsFiles").value = "";
+  renderSongsPending();
+};
+async function uploadOneSong(i, batchId) {
+  const row = songsPending[i];
+  if (!row) return;
+  row.status = "uploading"; row.error = ""; row.progress = 10;
+  renderSongsPending();
+  try {
+    if (!row.title.trim()) throw new Error("Title is required");
+    let bid = batchId;
+    if (!bid) {
+      const started = await call("/songs/batch/start", "POST", {});
+      bid = started.batch_id;
+      if (started.warning) setMsg(started.warning, false);
+    }
+    const fd = new FormData();
+    fd.append("title", row.title.trim());
+    fd.append("artist", (row.artist || "").trim());
+    fd.append("client_id", row.client_id);
+    fd.append("file", row.file, row.file.name);
+    row.progress = 40; renderSongsPending();
+    await upload("/songs/batch/" + bid + "/file", fd);
+    row.progress = 100; row.status = "ok"; row.error = "";
+    row._batch = bid;
+    renderSongsPending();
+    return bid;
+  } catch (e) {
+    row.status = "error"; row.error = e.message || "Upload failed"; row.progress = null;
+    renderSongsPending();
+    throw e;
+  }
+}
+$("songsUploadBtn").onclick = () => run(async () => {
+  if (!songsPending.length) throw new Error("Choose MP3 files first");
+  $("songsUploadProg").textContent = "Starting batch...";
+  const started = await call("/songs/batch/start", "POST", {});
+  if (started.warning) setMsg(started.warning, false);
+  const bid = started.batch_id;
+  let ok = 0, fail = 0;
+  for (let i = 0; i < songsPending.length; i++) {
+    $("songsUploadProg").textContent = `Uploading ${i + 1}/${songsPending.length}...`;
+    try {
+      await uploadOneSong(i, bid);
+      ok++;
+    } catch (_) { fail++; }
+  }
+  if (ok === 0) {
+    await call("/songs/batch/" + bid, "DELETE").catch(() => {});
+    throw new Error("No files uploaded. Fix errors and retry.");
+  }
+  $("songsUploadProg").textContent = "Committing to GitHub...";
+  await call("/songs/batch/" + bid + "/commit", "POST", {});
+  $("songsUploadProg").textContent = `Done: ${ok} uploaded` + (fail ? `, ${fail} failed` : "");
+  songsPending = songsPending.filter(r => r.status !== "ok");
+  renderSongsPending();
+  setMsg("Songs published.", true);
+  await loadSongsLive();
+});
+
+function songCard(song, idx, list) {
+  const box = el("div", { class: "song-row" });
+  box.appendChild(el("b", { text: `${idx + 1}. ${song.title}` }));
+  box.appendChild(el("p", { class: "hint", text: (song.artist ? song.artist + " · " : "") + song.id + " · " + fmtBytes(song.size) }));
+  if (song.url) {
+    const a = el("audio", { controls: "controls", preload: "none" });
+    a.src = song.url;
+    box.appendChild(a);
+  }
+  const title = el("input", { type: "text", maxlength: "60" }); title.value = song.title;
+  const artist = el("input", { type: "text", maxlength: "40" }); artist.value = song.artist || "";
+  box.append(labeled("Title", title), labeled("Artist", artist));
+  const actions = el("div", { class: "actions" });
+  const save = el("button", { type: "button", text: "Save" });
+  save.onclick = () => run(async () => {
+    await call("/songs/" + song.id, "PATCH", { title: title.value.trim(), artist: artist.value.trim() });
+    setMsg("Song updated.", true);
+    await loadSongsLive();
+  });
+  const up = el("button", { type: "button", text: "Up" });
+  up.disabled = idx === 0;
+  up.onclick = () => run(async () => {
+    const ids = list.map(s => s.id);
+    [ids[idx - 1], ids[idx]] = [ids[idx], ids[idx - 1]];
+    await call("/songs/reorder", "POST", { ids });
+    await loadSongsLive();
+  });
+  const down = el("button", { type: "button", text: "Down" });
+  down.disabled = idx >= list.length - 1;
+  down.onclick = () => run(async () => {
+    const ids = list.map(s => s.id);
+    [ids[idx + 1], ids[idx]] = [ids[idx], ids[idx + 1]];
+    await call("/songs/reorder", "POST", { ids });
+    await loadSongsLive();
+  });
+  const del = el("button", { type: "button", text: "Delete" });
+  del.onclick = () => confirm("Delete “" + song.title + "”? This cannot be undone.") && run(async () => {
+    await call("/songs/" + song.id, "DELETE");
+    setMsg("Song deleted.", true);
+    await loadSongsLive();
+  });
+  actions.append(save, up, down, del);
+  box.appendChild(actions);
+  return box;
+}
+async function loadSongsLive() {
+  const d = await call("/songs");
+  songsCache = d.songs || [];
+  const st = d.storage || {};
+  const idx = d.index || {};
+  $("songsStats").textContent =
+    `${songsCache.length} songs · library ${fmtBytes(st.songs_bytes)} · docs ${fmtBytes(st.docs_bytes)}` +
+    ` / ${fmtBytes(st.block_bytes)} · v${idx.version || 0}` +
+    (st.near_limit ? " · WARNING: near 500 MB" : "") +
+    (st.blocked ? " · BLOCKED: over 800 MB" : "");
+  renderSongsLive();
+}
+function renderSongsLive() {
+  const q = ($("songsSearch").value || "").trim().toLowerCase();
+  const box = $("songsLive");
+  box.replaceChildren();
+  const list = songsCache.filter(s => {
+    if (!q) return true;
+    return (s.title || "").toLowerCase().includes(q) || (s.artist || "").toLowerCase().includes(q) || (s.id || "").includes(q);
+  });
+  if (!list.length) {
+    box.appendChild(el("p", { class: "hint", text: songsCache.length ? "No matches." : "No songs yet." }));
+    return;
+  }
+  // When searching, show filtered cards but reorder uses full list indices carefully
+  list.forEach(song => {
+    const idx = songsCache.findIndex(s => s.id === song.id);
+    box.appendChild(songCard(song, idx, songsCache));
+  });
+}
+$("songsSearch").oninput = () => renderSongsLive();
+
 function showTab(name) {
-  ["devices","adhan","huruf","hadith","qa","api"].forEach(t => {
+  ["devices","adhan","huruf","hadith","qa","songs","api"].forEach(t => {
     $("tab-" + t).hidden = t !== name;
   });
   document.querySelectorAll("nav button").forEach(b => b.classList.toggle("on", b.dataset.tab === name));
@@ -465,6 +683,7 @@ function showTab(name) {
   if (name === "huruf") loadHuruf().catch(e => setMsg(e.message, false));
   if (name === "hadith") loadHadithLive().catch(e => setMsg(e.message, false));
   if (name === "qa") loadQaLive().catch(e => setMsg(e.message, false));
+  if (name === "songs") loadSongsLive().catch(e => setMsg(e.message, false));
 }
 document.querySelectorAll("nav button").forEach(b => b.onclick = () => showTab(b.dataset.tab));
 

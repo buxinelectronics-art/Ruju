@@ -75,11 +75,11 @@
  // Wi-Fi is NOT written in the code: the owner enters it from a phone.
  #define SETUP_AP_NAME  "Quran Player"
  
- // ---- your backend (copy ID and token from the dashboard) ----
+ // ---- your backend (copy ID and token from the dashboard; do not commit real secrets) ----
  #define BACKEND_HOST "ruju-zxb0.onrender.com"   // no https://, no slash
- #define PRODUCT_ID   "QP-D179E0F4"
- #define DEVICE_TOKEN "PwmtsYePeRjc37_lFsyEp-7MsnhPqPVfIwcxut4MHWM"
- #define FW_VERSION   "7.1"
+ #define PRODUCT_ID   "YOUR_PRODUCT_ID"
+ #define DEVICE_TOKEN "YOUR_DEVICE_TOKEN"
+ #define FW_VERSION   "7.2"
  // Default content site (dashboard can override per device). No trailing slash.
  #define CONTENT_BASE_URL "https://buxinelectronics-art.github.io/Ruju"
  #define CONTENT_SURAH 255          // Clip.surah for GitHub Pages / content MP3s
@@ -285,7 +285,7 @@
  
  enum Screen : uint8_t {
    SCR_HOME = 0, SCR_PLAYER = 1, SCR_AYAHS = 2, SCR_SETTINGS = 3, SCR_AI = 4,
-   SCR_ADHAN = 5, SCR_HURUF = 6, SCR_HADITH = 7, SCR_QA = 8
+   SCR_ADHAN = 5, SCR_HURUF = 6, SCR_HADITH = 7, SCR_QA = 8, SCR_SONGS = 9
  };
  enum PlayMode : uint8_t { MODE_SURAH = 0, MODE_AYAH = 1 };
  enum BootPhase : uint8_t { BOOT_WIFI, BOOT_BISMILLAH, BOOT_DONE };
@@ -323,6 +323,7 @@
  static char contentBase[64] = "/Ruju";   // path prefix, no trailing slash
  static uint32_t contentVerHadith = 1;
  static uint32_t contentVerQa = 1;
+ static uint32_t contentVerSongs = 1;
  
  // Adhan auto-play runtime (Phase 2)
  enum AdhanRun : uint8_t { AR_IDLE = 0, AR_WAIT_AI = 1, AR_PLAYING = 2, AR_BEEP = 3, AR_HOLD = 4 };
@@ -2258,13 +2259,13 @@
  // =====================================================================
  Screen screen = SCR_HOME;
  Screen prevScreen = SCR_HOME;
- int homeSel = 0;   // 0 Quran .. 6 Settings
+ int homeSel = 0;   // 0 Quran .. 7 Settings
  int homeTop = 0;   // first visible home row
  int setSel = 0;    // 0 Reciter, 1 Volume
- static const int HOME_COUNT = 7;
+ static const int HOME_COUNT = 8;
  static const int HOME_VISIBLE = 4;
- static const char* const HOME_LABELS[7] = {
-   "Quran", "Ustaz", "Adhan", "Huruf", "Hadith", "Q&A", "Settings"
+ static const char* const HOME_LABELS[8] = {
+   "Quran", "Ustaz", "Adhan", "Huruf", "Hadith", "Q&A", "Songs", "Settings"
  };
  
  PlayMode playMode = MODE_SURAH;
@@ -2570,6 +2571,18 @@
  static int qaLines = 0;
  static char qaLine[48][26];
  
+ enum SongMode : uint8_t { SONG_LIST = 0, SONG_PLAY = 1 };
+ static SongMode songMode = SONG_LIST;
+ static LibPhase songPhase = LP_LOAD;
+ static int songCount = 0, songIdx = 0, songPageSize = 10;
+ static int songPage = -1;            // 1-based page currently cached; -1 = none
+ static int songPageLoading = 0;      // page requested via docFetch
+ static char songIds[10][8];
+ static char songTitles[10][62];
+ static char songArtists[10][42];
+ static int songPageCount = 0;        // entries in current page cache
+ static bool songNeedPage = false;
+ 
  static void wrapLines(const char* text, char lines[][26], int maxLines, int* outCount) {
    *outCount = 0;
    while (*text && *outCount < maxLines) {
@@ -2663,6 +2676,88 @@
    docRequest(path);
  }
  
+ static int songPageOf(int idx) {
+   if (songPageSize < 1) songPageSize = 10;
+   return (idx / songPageSize) + 1;
+ }
+ 
+ static int songSlotOf(int idx) {
+   if (songPageSize < 1) songPageSize = 10;
+   return idx % songPageSize;
+ }
+ 
+ static bool songCacheHas(int idx) {
+   if (idx < 0 || idx >= songCount || songPage < 1) return false;
+   return songPageOf(idx) == songPage && songSlotOf(idx) < songPageCount;
+ }
+ 
+ static void songsRequestPage(int page) {
+   if (page < 1) page = 1;
+   songPhase = LP_LOAD;
+   songPageLoading = page;
+   songNeedPage = true;
+   char path[72];
+   snprintf(path, sizeof(path), "songs/page%03d.json?v=%lu",
+            page, (unsigned long)contentVerSongs);
+   docRequest(path);
+ }
+ 
+ static void songsEnsureIdx() {
+   if (songCount <= 0) { songPhase = LP_EMPTY; return; }
+   if (songIdx < 0) songIdx = 0;
+   if (songIdx >= songCount) songIdx = songCount - 1;
+   if (songCacheHas(songIdx)) {
+     songPhase = LP_READY;
+     songNeedPage = false;
+     return;
+   }
+   songsRequestPage(songPageOf(songIdx));
+ }
+ 
+ static void songsOpen() {
+   songMode = SONG_LIST;
+   songPhase = LP_LOAD;
+   songCount = songIdx = 0;
+   songPage = -1;
+   songPageCount = 0;
+   songPageSize = 10;
+   stopContentAudio();
+   char path[72];
+   snprintf(path, sizeof(path), "songs/index.json?v=%lu", (unsigned long)contentVerSongs);
+   docRequest(path);
+ }
+ 
+ static void songsPlayCurrent() {
+   if (!songCacheHas(songIdx)) { songsEnsureIdx(); return; }
+   int slot = songSlotOf(songIdx);
+   char path[56];
+   snprintf(path, sizeof(path), "songs/%s.mp3?v=%lu",
+            songIds[slot], (unsigned long)contentVerSongs);
+   songMode = SONG_PLAY;
+   startContentMp3(path);
+ }
+ 
+ static void songsPlayNextOrStop() {
+   if (songIdx + 1 < songCount) {
+     songIdx++;
+     if (!songCacheHas(songIdx)) {
+       // load page first; play after doc arrives
+       songMode = SONG_PLAY;
+       songNeedPage = true;
+       songsRequestPage(songPageOf(songIdx));
+       status = "Loading...";
+       dirty = true;
+       return;
+     }
+     songsPlayCurrent();
+   } else {
+     contentPlaying = false;
+     session = false;
+     status = "Done";
+     dirty = true;
+   }
+ }
+ 
  static void contentPollDocs() {
    lockSh();
    bool done = sh.docDone;
@@ -2741,6 +2836,49 @@
      wrapLines(combined, qaLine, 48, &qaLines);
      qaPhase = LP_READY;
      dirty = true;
+     return;
+   }
+ 
+   if (screen == SCR_SONGS) {
+     if (!ok) {
+       songPhase = (err == DOC_WIFI) ? LP_ERR : (err == DOC_NOTFOUND ? LP_EMPTY : LP_ERR);
+       status = (err == DOC_WIFI) ? "No Wi-Fi" : (err == DOC_NOTFOUND) ? "Not found" : "Error";
+       dirty = true;
+       return;
+     }
+     if (strstr(buf, "\"pageSize\"") || (strstr(buf, "\"count\"") && !strstr(buf, "\"songs\""))) {
+       contentVerSongs = (uint32_t)jsonInt(buf, "\"version\"", (int)contentVerSongs);
+       songCount = jsonInt(buf, "\"count\"", 0);
+       songPageSize = jsonInt(buf, "\"pageSize\"", 10);
+       if (songPageSize < 1) songPageSize = 10;
+       if (songCount <= 0) { songPhase = LP_EMPTY; dirty = true; return; }
+       songIdx = 0;
+       songsEnsureIdx();
+       dirty = true;
+       return;
+     }
+     if (strstr(buf, "\"songs\"")) {
+       songPageCount = 0;
+       const char* p = buf;
+       while (songPageCount < 10 && (p = strstr(p, "\"id\"")) != nullptr) {
+         char id[8], title[62], artist[42];
+         if (!jsonFind(p, "id", id, sizeof(id))) { p += 4; continue; }
+         if (!jsonFind(p, "title", title, sizeof(title))) title[0] = 0;
+         if (!jsonFind(p, "artist", artist, sizeof(artist))) artist[0] = 0;
+         snprintf(songIds[songPageCount], sizeof(songIds[0]), "%s", id);
+         snprintf(songTitles[songPageCount], sizeof(songTitles[0]), "%s", title);
+         snprintf(songArtists[songPageCount], sizeof(songArtists[0]), "%s", artist);
+         songPageCount++;
+         p += 4;
+       }
+       songPage = songPageLoading > 0 ? songPageLoading : songPageOf(songIdx);
+       songPhase = (songPageCount > 0) ? LP_READY : LP_EMPTY;
+       songNeedPage = false;
+       if (songMode == SONG_PLAY && songCacheHas(songIdx) && !session) {
+         songsPlayCurrent();
+       }
+       dirty = true;
+     }
    }
  }
  
@@ -2816,6 +2954,70 @@
      u8g2.drawStr(0, 46, src);
    }
    drawFooter("1/2 Scroll", contentPlaying ? "OK Stop" : "OK Play", "5 AI");
+ }
+ 
+ static void drawScrollLine(int y, const char* text) {
+   if (!text || !text[0]) return;
+   int w = u8g2.getStrWidth(text);
+   if (w <= 128) { u8g2.drawStr(0, y, text); return; }
+   int span = w + 24;
+   int off = (int)((millis() / 45) % (uint32_t)span);
+   u8g2.drawStr(4 - off, y, text);
+ }
+ 
+ void drawSongs() {
+   drawStatusBar();
+   u8g2.setFont(u8g2_font_6x10_tr);
+   if (songPhase == LP_LOAD) { txtC(28, "Loading..."); drawFooter("<Back", nullptr, "5 AI"); return; }
+   if (songPhase == LP_EMPTY) { txtC(28, "Empty"); drawFooter("<Back", nullptr, "5 AI"); return; }
+   if (songPhase == LP_ERR) { txtC(28, status); drawFooter("<Back", nullptr, "5 AI"); return; }
+ 
+   if (songMode == SONG_LIST) {
+     char head[28];
+     snprintf(head, sizeof(head), "%d/%d", songIdx + 1, songCount);
+     u8g2.setFont(u8g2_font_5x7_tr);
+     u8g2.drawStr(0, 12, head);
+     if (songCacheHas(songIdx)) {
+       int slot = songSlotOf(songIdx);
+       u8g2.setFont(u8g2_font_6x10_tr);
+       drawScrollLine(24, songTitles[slot]);
+       u8g2.setFont(u8g2_font_5x7_tr);
+       if (songArtists[slot][0]) drawScrollLine(38, songArtists[slot]);
+     } else {
+       txtC(28, "Loading...");
+     }
+     drawFooter("1/2 Song", "OK Play", "5 AI");
+     return;
+   }
+ 
+   // Player view
+   if (!songCacheHas(songIdx)) {
+     txtC(28, "Loading...");
+     drawFooter("<List", nullptr, "5 AI");
+     return;
+   }
+   int slot = songSlotOf(songIdx);
+   u8g2.setFont(u8g2_font_6x10_tr);
+   drawScrollLine(12, songTitles[slot]);
+   u8g2.setFont(u8g2_font_5x7_tr);
+   if (songArtists[slot][0]) drawScrollLine(24, songArtists[slot]);
+   else {
+     char pos[20];
+     snprintf(pos, sizeof(pos), "%d/%d", songIdx + 1, songCount);
+     u8g2.drawStr(0, 24, pos);
+   }
+ 
+   bool live = session && ui.gen == playGen && ui.clip.surah == CONTENT_SURAH;
+   u8g2.drawRFrame(2, 34, 124, 5, 2);
+   int fw = live ? (int)(ui.progress * 120.0f) : 0;
+   if (fw > 0) u8g2.drawBox(4, 35, fw, 3);
+   char e[12], tt[12], buf[28];
+   fmtTime(live ? ui.elapsedMs : 0, e, sizeof(e));
+   if (live && ui.totalMs > 0) fmtTime(ui.totalMs, tt, sizeof(tt));
+   else strcpy(tt, "--:--");
+   snprintf(buf, sizeof(buf), "%s / %s", e, tt);
+   txtC(42, buf);
+   drawFooter("1/2 Prev/Next", paused ? "OK Play" : "OK Pause", "< Stop");
  }
  
  // ---------------- PLAYER ----------------
@@ -3038,9 +3240,10 @@
        case SCR_SETTINGS: drawSettings(); break;
        case SCR_AI:       drawAI();       break;
        case SCR_ADHAN:    drawAdhan();    break;
-       case SCR_HURUF:    drawHuruf();  break;
-       case SCR_HADITH:   drawHadith(); break;
-       case SCR_QA:       drawQA();     break;
+      case SCR_HURUF:    drawHuruf();  break;
+      case SCR_HADITH:   drawHadith(); break;
+      case SCR_QA:       drawQA();     break;
+      case SCR_SONGS:    drawSongs();  break;
      }
    }
    u8g2.sendBuffer();
@@ -3119,7 +3322,8 @@
  
  void goScreen(Screen s) {
    if (screen == SCR_AI && s != SCR_AI) { playerStop(); aiSetOpen(false); }
-   if (screen != s && (screen == SCR_HURUF || screen == SCR_HADITH || screen == SCR_QA)) {
+   if (screen != s && (screen == SCR_HURUF || screen == SCR_HADITH || screen == SCR_QA ||
+                       screen == SCR_SONGS)) {
      docCancel();
      stopContentAudio();
    }
@@ -3188,6 +3392,13 @@
      dirty = true;
      return;
    }
+   if (screen == SCR_SONGS && songMode == SONG_PLAY) {
+     stopContentAudio();
+     songMode = SONG_LIST;
+     status = "Ready";
+     dirty = true;
+     return;
+   }
    if (session) stopPlayback("Stopped");
    contentPlaying = false;
    switch (screen) {
@@ -3251,13 +3462,15 @@
    adhanResumeScreen = (screen == SCR_AI) ? aiReturn : screen;
    if (adhanResumeScreen == SCR_ADHAN || adhanResumeScreen == SCR_AI ||
        adhanResumeScreen == SCR_HURUF || adhanResumeScreen == SCR_HADITH ||
-       adhanResumeScreen == SCR_QA)
+       adhanResumeScreen == SCR_QA || adhanResumeScreen == SCR_SONGS)
      adhanResumeScreen = SCR_PLAYER;
    adhanResumeWantPlay = session && !paused && surah >= 1 && surah <= 114;
  
    if (screen == SCR_AI) aiSetOpen(false);
    if (session) stopPlayback("Adhan");
- 
+   contentPlaying = false;
+   if (screen == SCR_SONGS) songMode = SONG_LIST;
+
    const char* file = (prayerId == PT_FAJR) ? "adhan/fajr.mp3" : "adhan/adhan.mp3";
    lockSh();
    snprintf(sh.contentPath, sizeof(sh.contentPath), "%s", file);
@@ -3387,6 +3600,10 @@
      paused = false;
      if (s.clip.surah == CONTENT_SURAH) contentPlaying = false;
      msg = "Done";
+     if (screen == SCR_SONGS && songMode == SONG_PLAY && adhanRun == AR_IDLE) {
+       songsPlayNextOrStop();
+       return;
+     }
    } else if (s.state == PS_ERROR) {
      session = false;
      paused = false;
@@ -3395,7 +3612,7 @@
        surah = s.clip.surah;                 // OK retries from the ayah that failed
        ayah = s.clip.ayah;
      }
-     msg = (s.error == PE_WIFI) ? "No WiFi" : (s.error == PE_NOTFOUND) ? "Not found" : "Network error";
+     msg = (s.error == PE_WIFI) ? "No Wi-Fi" : (s.error == PE_NOTFOUND) ? "Not found" : "Network error";
      dirty = true;
    } else {
      if (s.clip.surah >= 1 && s.clip.surah <= 114 &&
@@ -3522,6 +3739,9 @@
          } else if (homeSel == 5) {
            qaOpen();
            goScreen(SCR_QA);
+         } else if (homeSel == 6) {
+           songsOpen();
+           goScreen(SCR_SONGS);
          } else {
            goScreen(SCR_SETTINGS);
          }
@@ -3606,6 +3826,32 @@
              else if (qaItemIdx + 1 < qaItemCount) { qaItemIdx++; qaLoadItem(); }
            }
            dirty = true;
+         }
+       }
+       break;
+ 
+     case SCR_SONGS:
+       if (songPhase == LP_LOAD || songPhase == LP_ERR || songPhase == LP_EMPTY) break;
+       if (songMode == SONG_LIST) {
+         if (k == KEY1 && songIdx > 0) { songIdx--; songsEnsureIdx(); dirty = true; }
+         else if (k == KEY2 && songIdx + 1 < songCount) { songIdx++; songsEnsureIdx(); dirty = true; }
+         else if (k == KEY3) songsPlayCurrent();
+       } else {
+         if (k == KEY3) {
+           if (session) togglePlay();
+           else songsPlayCurrent();
+         } else if (k == KEY1 || k == KEY2) {
+           stopContentAudio();
+           if (k == KEY1 && songIdx > 0) songIdx--;
+           else if (k == KEY2 && songIdx + 1 < songCount) songIdx++;
+           if (!songCacheHas(songIdx)) {
+             songNeedPage = true;
+             songsRequestPage(songPageOf(songIdx));
+             status = "Loading...";
+             dirty = true;
+           } else {
+             songsPlayCurrent();
+           }
          }
        }
        break;
@@ -3795,6 +4041,7 @@
    uint32_t now = millis();
    bool moving = bootPhase == BOOT_DONE && screen == SCR_PLAYER && session && !paused;
    uint32_t period = moving ? 500 : 5000;
+   if (screen == SCR_SONGS && songPhase == LP_READY) period = 200;  // title scroll + progress
    if (screen == SCR_AI) {
      if (aiPhase == AI_RECORDING) period = 150;
      else if (aiPhase == AI_LISTENED || aiPhase == AI_THINKING) period = 350;
